@@ -1,0 +1,162 @@
+#!/usr/bin/env bash
+# Snapshot current SSH sessions (inbound + outbound) with remote IP + user.
+# Inbound sessions also show the interactive shell's current working directory.
+# A TMUX section lists active tmux sessions across all users.
+# Output is shown on the lock screen (xscreensaver). Runs as root.
+set -u
+
+OUT=${SSH_STATUS_OUT:-/run/ssh-status}   # override only for testing
+
+# comm names we treat as "the session's interactive process" for cwd purposes
+ALLOWED_RE='^(bash|zsh|fish|sh|dash|ash|ksh|tcsh|csh|claude|node)$'
+
+# process maps, populated once per run by build_maps()
+declare -A CHILDREN CMD TTY
+
+build_maps() {
+  local pid ppid tty comm
+  while read -r pid ppid tty comm; do
+    CMD[$pid]=$comm
+    TTY[$pid]=$tty
+    CHILDREN[$ppid]="${CHILDREN[$ppid]:-} $pid"
+  done < <(ps -eo pid=,ppid=,tty=,comm= 2>/dev/null)
+}
+
+# read /proc/<pid>/stat and echo the requested field:
+#   tpgid    -> controlling tty's foreground process group
+#   start    -> process start time (jiffies since boot)
+stat_field() { # $1=pid $2=tpgid|start
+  local s; s=$(cat "/proc/$1/stat" 2>/dev/null) || return 1
+  s=${s##*") "}          # drop "pid (comm) ", leaving state onward
+  set -- $s              # $1=state $2=ppid $3=pgrp $4=session $5=tty_nr $6=tpgid ... $20=starttime
+  case $2 in
+    tpgid) printf '%s' "${6:-0}";;
+    start) printf '%s' "${20:-0}";;
+  esac
+}
+
+# For an inbound sshd connection pid, print the cwd of its interactive shell.
+# Walk descendants down to the session's controlling pts, then prefer the
+# foreground process group leader (a shell or claude/node) on that pts; fall
+# back to the most-recently-started such process. Empty output = nothing found.
+session_cwd() { # $1=sshd pid reported by ss
+  local sshpid=$1
+  [ -n "$sshpid" ] || return 0
+
+  # descend from sshpid, recording the session pts and every pid sharing it
+  local pts="" p kid guard=0
+  local -a frontier=("$sshpid") next onpts=()
+  while [ ${#frontier[@]} -gt 0 ] && [ $guard -lt 500 ]; do
+    guard=$((guard + 1))
+    next=()
+    for p in "${frontier[@]}"; do
+      local t=${TTY[$p]:-?}
+      if [[ $t == pts/* ]]; then
+        [ -z "$pts" ] && pts=$t
+        [ "$t" = "$pts" ] && onpts+=("$p")
+      fi
+      for kid in ${CHILDREN[$p]:-}; do next+=("$kid"); done
+    done
+    frontier=("${next[@]}")
+  done
+  [ -n "$pts" ] && [ ${#onpts[@]} -gt 0 ] || return 0
+
+  # candidate procs on the pts whose comm looks like an interactive process
+  local -a cands=()
+  for p in "${onpts[@]}"; do
+    [[ ${CMD[$p]:-} =~ $ALLOWED_RE ]] && cands+=("$p")
+  done
+  [ ${#cands[@]} -gt 0 ] || return 0
+
+  # prefer the pts foreground process group leader if it is a candidate
+  local chosen="" tpgid
+  tpgid=$(stat_field "${onpts[0]}" tpgid)
+  for p in "${cands[@]}"; do
+    [ "$p" = "$tpgid" ] && { chosen=$p; break; }
+  done
+  # else the most-recently-started candidate (most recently active)
+  if [ -z "$chosen" ]; then
+    local best=-1 st
+    for p in "${cands[@]}"; do
+      st=$(stat_field "$p" start); st=${st:-0}
+      [ "$st" -gt "$best" ] && { best=$st; chosen=$p; }
+    done
+  fi
+
+  readlink "/proc/$chosen/cwd" 2>/dev/null || true
+}
+
+emit() { # $1=ss filter expression  $2=want_cwd (1=inbound, 0=outbound)
+  local any=0 line ip pid usr cwd
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    ip=$(awk '{print $4}' <<<"$line"); ip=${ip%:*}
+    pid=$(grep -oE 'pid=[0-9]+' <<<"$line" | head -1 | cut -d= -f2)
+    usr=""; [ -n "$pid" ] && usr=$(ps -o user= -p "$pid" 2>/dev/null | tr -d ' ')
+    cwd=""
+    [ "$2" = 1 ] && [ -n "$pid" ] && cwd=$(session_cwd "$pid")
+    if [ -n "$cwd" ]; then
+      printf "  %-21s user=%-8s cwd=%s\n" "$ip" "${usr:-?}" "$cwd"
+    else
+      printf "  %-21s user=%s\n" "$ip" "${usr:-?}"
+    fi
+    any=1
+  done < <(ss -tnHp state established "$1" 2>/dev/null)
+  [ "$any" = 0 ] && echo "  (none)"
+}
+
+# run tmux as the socket's owning uid (passwordless when this script runs as
+# root; direct call when we already are that uid, which keeps it testable)
+tmux_as() { # $1=uid  rest=tmux args
+  local uid=$1; shift
+  if [ "$(id -u)" = "$uid" ]; then
+    tmux "$@"
+  else
+    sudo -n -u"#$uid" tmux "$@"
+  fi
+}
+
+tmux_section() {
+  command -v tmux >/dev/null 2>&1 || { echo "  (none)"; return; }
+  local any=0 d uid user sock name wins att
+  for d in /tmp/tmux-*/; do
+    [ -d "$d" ] || continue
+    uid=${d#/tmp/tmux-}; uid=${uid%/}
+    case $uid in ''|*[!0-9]*) continue;; esac
+    user=$(getent passwd "$uid" | cut -d: -f1); user=${user:-uid$uid}
+    for sock in "$d"*; do
+      [ -S "$sock" ] || continue
+      while IFS=$'\t' read -r name wins att; do
+        [ -n "$name" ] || continue
+        printf "  %-10s %-16s %s window(s), %s\n" "$user" "$name" "$wins" "$att"
+        any=1
+      done < <(tmux_as "$uid" -S "$sock" list-sessions \
+                 -F '#{session_name}	#{session_windows}	#{?session_attached,attached,detached}' \
+                 2>/dev/null)
+    done
+  done
+  [ "$any" = 0 ] && echo "  (none)"
+}
+
+main() {
+  build_maps
+  {
+    echo "SSH SESSIONS  -  $(hostname)  -  $(date '+%F %T %Z')"
+    echo
+    echo "INBOUND   (remote -> this host:22)"
+    emit '( sport = :22 )' 1
+    echo
+    echo "OUTBOUND  (this host -> remote:22)"
+    emit '( dport = :22 )' 0
+    echo
+    echo "TMUX      (sessions across all users)"
+    tmux_section
+  } > "$OUT.tmp" 2>/dev/null
+  mv "$OUT.tmp" "$OUT"
+  chmod 0644 "$OUT"
+}
+
+# run unless sourced (test harness sources this file to reach the functions)
+if ! (return 0 2>/dev/null); then
+  main
+fi

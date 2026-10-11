@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh /run/ssh-status (SSH sessions shown on the lock screen)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/bin/bash -c 'while :; do /usr/local/bin/ssh-status; sleep 3; done'
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,239 @@
+lobby — who is around on an X11 box, shown on the lock screen and desktop
+==========================================================================
+
+Part of lore: small tools grown on one Linux box, made portable.
+
+WHAT THIS IS
+------------
+lobby draws plain-text panels onto the xscreensaver lock screen and onto the
+desktop. A panel is whatever a command prints, refreshed every few seconds.
+
+  lockin            the renderer: lock screen, or desktop with --desk
+  ssh-status        panel: SSH sessions in and out, and tmux sessions
+  claude-sessions   panel: every Claude Code session, newest first
+
+The look is fixed on purpose: one serif font, one colour, text only.
+
+REQUIREMENTS
+------------
+- X11 and xscreensaver. A GNOME/Wayland lock screen cannot run this.
+- python3 3.11+, PyGObject with GTK 3, pycairo:
+    sudo apt install python3-gi python3-gi-cairo gir1.2-gtk-3.0 xscreensaver \
+                     x11-xserver-utils
+- Font "Crimson Text" (SIL OFL). Without it another serif is used.
+- ssh-status runs as root: only root sees other users' sshd processes.
+- Tests: Xvfb (sudo apt install xvfb).
+
+INSTALL
+-------
+  install -m 0755 lockin claude-sessions ~/.local/bin/
+  sudo install -m 0755 ssh-status /usr/local/bin/ssh-status
+  sudo install -m 0644 ssh-status.service /etc/systemd/system/
+  sudo systemctl enable --now ssh-status
+
+Never symlink ssh-status into a folder you can write: it runs as root.
+
+Lock screen, in ~/.xscreensaver (full paths; it runs through /bin/sh):
+
+  mode:       one
+  programs:   /home/me/.local/bin/lockin                                 \
+                --left 'cat /run/ssh-status'                             \
+                --right '/home/me/.local/bin/claude-sessions --tsv'      \
+                2>>/home/me/.local/share/lockin.log                      \n
+
+Desktop, ~/.config/autostart/lockin.desktop:
+
+  [Desktop Entry]
+  Type=Application
+  Name=lockin
+  Exec=/home/me/.local/bin/lockin --desk --left "cat /run/ssh-status" --right "/home/me/.local/bin/claude-sessions --tsv"
+
+LOCKIN
+------
+  lockin [--desk] [--left CMD] [--right CMD]
+
+Each CMD runs through /bin/sh -c. Its standard output is the panel's text.
+
+Lock screen (default). xscreensaver starts one lockin per monitor and passes
+the window id in $XSCREENSAVER_WINDOW (decimal, or hex with 0x). lockin
+paints the whole window #0a0a0a, then:
+  - draws the left panel 90 px from the left edge and 70 px from the top;
+  - draws the right panel only if the window is at least as wide as it is
+    tall, also 70 px from the top. Its text block ends 90 px from the right
+    edge, but starts no closer than 90 px to the right end of the left
+    panel's widest line. Lines in a block are left-aligned. The right
+    command is never run for a window that is taller than wide.
+
+Desktop (--desk). One window per given panel, on X's primary monitor (else
+the first monitor at least as wide as tall, else the first), in the order
+`xrandr --listmonitors` gives. Windows stay below all others, show on every
+workspace, never take focus and are not in the taskbar. Both are as tall as
+the monitor and painted #0a0a0a.
+  - left: at the monitor's left edge, 1280 px wide, text 44 px from the
+    left and 40 px from the top.
+  - right: against the monitor's right edge, as wide as its widest line plus
+    2 x 44 px, but never wider than the monitor minus 1280 px. Text 44 px
+    from its left and 40 px from the top.
+
+Panels, everywhere:
+  - Text is Crimson Text 36, colour #dcdcdc.
+  - A line containing a TAB is a row of cells. Cells line up in columns
+    across all rows of the panel: each column starts 32 px after the end of
+    the widest cell in the column before it. Lines without a TAB are drawn
+    as they are.
+  - A line that would reach into the right margin (as wide as the left
+    one) is cut short with "…". Only whole lines that fit above the bottom
+    margin are drawn: at most $LINES.
+  - Each run gets $LINES: how many lines fit, which is (panel height minus
+    twice the top margin) divided by the line height, rounded down.
+  - The left command starts every 2 s, the right every 10 s, counted from
+    the start of the previous run. A new run never starts while the
+    previous one is still going.
+  - If a run exits non-zero, the panel keeps the last good text. Before any
+    good run it shows: (CMD failed: exit N)
+
+CLAUDE-SESSIONS
+---------------
+  claude-sessions [-n N] [-r] [--tsv] [WORD...]
+
+Lists Claude Code sessions from two config folders, each its own section:
+
+  MAIN   ~/.claude        sessions started with `claude`
+  ALT    ~/.claude-alt    sessions started with `claude-alt`, i.e.
+                          CLAUDE_CONFIG_DIR=~/.claude-alt claude
+
+A config folder that does not exist gets no section.
+
+  -n N      at most N rows per section; default 25, 0 means all
+  -r        under each row, the command that resumes that session:
+              "     cd <folder> && <claude or claude-alt> --resume <id>"
+            The folder is written in full, with ~ for $HOME.
+  --tsv     cells joined by one TAB instead of padding, for lockin. When
+            $LINES is set, the output is fitted to that many lines and -n
+            is ignored. Resume lines (-r) are not counted.
+  WORD...   keep only rows whose name, auto title, last prompt, folder or
+            session id contain every WORD, ignoring case. A grouped row is
+            matched on the session it shows.
+
+Example (invented sessions):
+
+  CLAUDE SESSIONS  -  by last activity  -  tmux recorded since Wed 18:52
+
+  MAIN      (claude -> ~/.claude)
+    11:35       SITE-DEPLOY      idle   tmux=web   cwd=~/src/site
+    10:02       notes (3)                          cwd=~/notes
+    Tue 09:14   fix flaky test                     cwd=~/src/api
+
+  ALT       (claude-alt -> ~/.claude-alt)
+    (none)
+
+Lines, in order:
+  - Header: "CLAUDE SESSIONS  -  by last activity". If any tmux-resurrect
+    snapshot exists it continues "  -  tmux recorded since " and the time
+    in the oldest snapshot's file name, in the time format below.
+  - A blank line, then the sections, MAIN first, one blank line between.
+  - Section title: the label padded with spaces to 9 characters, a space,
+    then "(<command> -> <config folder>)".
+  - One row per session, newest first, or "  (none)" if there are none.
+
+Row cells, in order:
+  1. two spaces and the time of last activity: the transcript file's
+     modification time, in local time.
+       same day as now          HH:MM          11:35
+       less than 6 x 24 h ago   Ddd HH:MM      Tue 09:14
+       older                    D Mon          3 Oct
+  2. name: the /rename name, else Claude's auto title, else the first 8
+     characters of the session id. Over 32 characters: the first 31 and
+     "…". Sessions in the same section with the same (full) name and
+     folder are one row; " (N)" is added after it when N > 1. That row
+     shows the running session if one is running, else the newest; its
+     time is the newest's.
+  3. state of a running session: its status, e.g. busy, idle, waiting, or
+     "live" if it has none. Empty if not running.
+  4. "tmux=<tmux session>" if the session ran inside tmux, else empty.
+  5. "cwd=<folder>", with ~ for $HOME. If that is longer than 40
+     characters it keeps its first part and its last two, joined by "/…/":
+     ~/…/experiments/run_c (outside $HOME the first part is empty: /…/x/y)
+
+Padded output: each column is as wide as its widest cell in the whole
+output, columns are separated by three spaces, and trailing spaces are
+removed. --tsv: cells joined by one TAB, empty cells kept.
+
+Fitting to $LINES (--tsv): header, blank line, section titles and the blank
+lines between sections count. ALT is given up to 5 rows, MAIN as many rows
+as fit in the rest, and ALT then takes whatever is left. Every section shows
+at least one line, even if that makes the output longer than $LINES.
+
+Where the data comes from
+  <config>/projects/<anything>/<session id>.jsonl
+      Claude's transcript, one JSON object per line. Files in deeper
+      folders (subagents) are ignored. A transcript with no /rename name, no
+      auto title and no last prompt is not listed. Used lines:
+        {"cwd": "/path", ...}                        the folder (first one)
+        {"type": "custom-title", "customTitle": "…"}   /rename name
+        {"type": "ai-title", "aiTitle": "…"}           auto title
+        {"type": "last-prompt", "lastPrompt": "…"}     last prompt
+      Later title and prompt lines replace earlier ones. If no line has a
+      cwd, the folder is the <anything> folder name with "-" read as "/".
+  <config>/sessions/<pid>.json
+      Written by Claude while it runs: {"pid": 123, "sessionId": "…",
+      "procStart": "<field 22 of /proc/<pid>/stat>", "status": "idle",
+      "startedAt": <ms>, "tmux": "<session>:@<window>.%<pane>"}. "tmux" is
+      only present inside tmux. The session counts as running if that pid
+      is alive and its start time still equals procStart.
+  ~/.local/share/tmux/resurrect/tmux_resurrect_YYYYMMDDTHHMMSS.txt
+      tmux-resurrect snapshots, TAB-separated. On a line whose 1st field is
+      "pane": 2nd = tmux session, 7th = pane title, 8th = ":" + folder,
+      10th = pane command, 11th = ":" + full command. It is a Claude pane if
+      the 10th or 11th field contains "claude". Claude titles its pane with
+      a status symbol, a space, and the session name.
+  ~/.local/state/claude-sessions/tmux.tsv
+      claude-sessions' own memory, because Claude deletes sessions/<pid>.json
+      when it exits. Each run appends "<session id>\t<tmux session>\n" for
+      ids seen in sessions/*.json that are new or newly inside tmux (empty
+      tmux session = seen outside tmux).
+
+The tmux cell, best evidence first:
+  1. the tmux session recorded for this id in sessions/*.json (running or
+     not) or tmux.tsv; the latest one recorded wins;
+  2. else the tmux session of a resurrect Claude pane whose title, without
+     the symbol, equals this session's /rename name or auto title, and
+     whose folder equals this session's folder; the newest snapshot wins;
+  3. else empty. Before the first snapshot there is no record, which is
+     why the header says since when.
+
+SSH-STATUS
+----------
+  ssh-status
+
+Writes a snapshot to /run/ssh-status ($SSH_STATUS_OUT overrides the path):
+
+  SSH SESSIONS  -  <hostname>  -  <YYYY-MM-DD HH:MM:SS TZ>
+
+  INBOUND   (remote -> this host:22)
+    <ip>   user=<user>   cwd=<folder of the session's shell>
+
+  OUTBOUND  (this host -> remote:22)
+    <ip>   user=<user>
+
+  TMUX      (sessions across all users)
+    <user>   <session>   <N> window(s), attached|detached
+
+with "  (none)" for an empty section and a blank line between sections.
+ssh-status.service reruns it every 3 s.
+
+PRIVACY
+-------
+The lock screen shows IP addresses, user names, folders and session names
+to anyone in front of the screen. Choose panels with that in mind.
+
+TESTS
+-----
+  python3 -m unittest discover -s tests -t .
+
+Tests use made-up data in temporary folders and their own Xvfb displays.
+lockin tests are skipped when Xvfb is not on PATH.
+
+LICENSE
+-------
+MIT, see LICENSE.

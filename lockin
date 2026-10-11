@@ -1,0 +1,245 @@
+#!/usr/bin/env python3
+"""lockin: draw text panels on the xscreensaver lock screen, or on the
+desktop with --desk. A panel is the standard output of a shell command,
+rerun every few seconds. See README.txt.
+
+  lockin [--desk] [--left CMD] [--right CMD]
+"""
+import argparse, os, re, subprocess, sys, threading, time
+import gi
+gi.require_version('Gdk', '3.0')
+gi.require_version('GdkX11', '3.0')
+gi.require_version('Gtk', '3.0')
+gi.require_version('Pango', '1.0')
+gi.require_version('PangoCairo', '1.0')
+from gi.repository import Gdk, GdkX11, GLib, Pango, PangoCairo
+gi.require_foreign('cairo')  # load the gi<->pycairo bridge (python3-gi-cairo)
+
+FONT = 'Crimson Text 36'
+FG = (0.86, 0.86, 0.86)    # #dcdcdc
+BG = (0.04, 0.04, 0.04)    # #0a0a0a
+GAP = 32                   # px between TAB columns
+EVERY = {'left': 2, 'right': 10}
+LOCK_MARGIN = (90, 70)
+DESK_MARGIN = (44, 40)
+DESK_LEFT_W = 1280
+
+
+def log(*a):
+    print(time.strftime('%F %T'), *a, file=sys.stderr, flush=True)
+
+
+class Panel:
+    """Reruns a shell command in the background; keeps its last good output."""
+
+    def __init__(self, cmd, every, changed):
+        self.cmd, self.every, self.changed = cmd, every, changed
+        self.text, self.good = '', False
+        self.lines = None  # set by the first draw: how many lines fit
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def _loop(self):
+        while self.lines is None:
+            time.sleep(0.05)
+        while True:
+            start = time.monotonic()
+            env = dict(os.environ, LINES=str(self.lines))
+            p = subprocess.run(['/bin/sh', '-c', self.cmd], stdout=subprocess.PIPE,
+                               env=env, encoding='utf-8', errors='replace')
+            if p.returncode == 0:
+                text, self.good = p.stdout.rstrip('\n'), True
+            elif self.good:
+                text = self.text
+            else:
+                text = f'({self.cmd} failed: exit {p.returncode})'
+            if text != self.text:
+                self.text = text
+                GLib.idle_add(self._notify)
+            time.sleep(max(0.0, start + self.every - time.monotonic()))
+
+    def _notify(self):
+        self.changed()
+        return False  # once, on the main loop
+
+
+def draw(ctx, text, x, y, w, h, margin_x, margin_y, align='left', min_x=0):
+    """Draw text into the rect (x, y, w, h); TAB-separated cells line up in
+    columns. align='right' puts the block against the right edge, but never
+    left of min_x. Returns (natural width of the text, lines that fit)."""
+    lay = PangoCairo.create_layout(ctx)
+    lay.set_font_description(Pango.FontDescription(FONT))
+    lay.set_text('Xg', -1)
+    fit = max(1, (h - 2 * margin_y) // lay.get_pixel_size()[1])
+    lines = text.split('\n')[:fit]
+
+    # each column starts GAP px after the widest cell of the column before it
+    widths = []
+    for ln in lines:
+        if '\t' in ln:
+            for i, c in enumerate(ln.split('\t')):
+                lay.set_text(c, -1)
+                cw = lay.get_pixel_size()[0]
+                if i < len(widths):
+                    widths[i] = max(widths[i], cw)
+                else:
+                    widths.append(cw)
+    if widths:
+        tabs = Pango.TabArray.new(max(1, len(widths) - 1), True)
+        pos = 0
+        for i, cw in enumerate(widths[:-1]):
+            pos += cw + GAP
+            tabs.set_tab(i, Pango.TabAlign.LEFT, pos)
+        lay.set_tabs(tabs)
+    lay.set_text('\n'.join(lines), -1)
+
+    natural = lay.get_pixel_size()[0]
+    if align == 'right':
+        left = max(x + w - margin_x - natural, min_x)
+    else:
+        left = x + margin_x
+    room = x + w - margin_x - left
+    if natural > room:
+        lay.set_width(room * Pango.SCALE)
+        lay.set_ellipsize(Pango.EllipsizeMode.END)
+    ctx.move_to(left, y + margin_y)
+    ctx.set_source_rgb(*FG)
+    PangoCairo.show_layout(ctx, lay)
+    return natural, fit
+
+
+# ---- lock screen: draw into the window xscreensaver hands us ---------------
+
+def lock(args):
+    xid = int(os.environ['XSCREENSAVER_WINDOW'], 0)
+    disp = Gdk.Display.get_default()
+    win = GdkX11.X11Window.foreign_new_for_display(disp, xid)
+    w, h = win.get_width(), win.get_height()
+    mx, my = LOCK_MARGIN
+    panels = {}
+
+    def redraw():
+        try:
+            ctx = win.cairo_create()
+            ctx.set_source_rgb(*BG)
+            ctx.paint()
+            min_x = mx
+            if 'left' in panels:
+                lw, panels['left'].lines = draw(ctx, panels['left'].text, 0, 0, w, h, mx, my)
+                min_x += lw + mx
+            if 'right' in panels:  # landscape only
+                _, panels['right'].lines = draw(ctx, panels['right'].text, 0, 0, w, h, mx, my,
+                                                align='right', min_x=min_x)
+            disp.flush()
+        except Exception as e:
+            log('draw error:', e)
+        return True
+
+    if args.left:
+        panels['left'] = Panel(args.left, EVERY['left'], redraw)
+    if args.right and w >= h:
+        panels['right'] = Panel(args.right, EVERY['right'], redraw)
+    redraw()
+    GLib.timeout_add_seconds(2, redraw)  # repaint after the unlock dialog
+    GLib.MainLoop().run()
+
+
+# ---- desktop: keep-below windows on one monitor ----------------------------
+
+def pick_monitor():
+    """X's primary monitor, else the first landscape one, else the first, in
+    xrandr's order. (GDK invents a primary when X has none, so ask xrandr.)"""
+    out = subprocess.run(['xrandr', '--listmonitors'], stdout=subprocess.PIPE, text=True).stdout
+    # " 0: +*DP-2 3840/596x2160/335+2160+0  DP-2"  (* = primary)
+    mons = [(m[1] == '*', int(m[4]), int(m[5]), int(m[2]), int(m[3])) for m in
+            re.finditer(r'^\s*\d+: \+?(\*?)\S+ (\d+)/\d+x(\d+)/\d+\+(\d+)\+(\d+)', out, re.M)]
+    pick = [m for m in mons if m[0]] or [m for m in mons if m[3] >= m[4]] or mons
+    return pick[0][1:]
+
+
+def desk(args):
+    from gi.repository import Gtk
+
+    class DeskPanel(Gtk.Window):
+        def __init__(self, side, cmd, mon):
+            super().__init__(type=Gtk.WindowType.TOPLEVEL)
+            self.set_title(f'lockin-{side}')
+            self.side, self.mon = side, mon
+            x, y, w, h = mon
+            self.panel_w = DESK_LEFT_W if side == 'left' else 1400  # right: refit on draw
+
+            # desktop-widget behaviour
+            self.set_decorated(False)
+            self.set_skip_taskbar_hint(True)
+            self.set_skip_pager_hint(True)
+            self.set_accept_focus(False)
+            self.set_can_focus(False)
+            self.set_focus_on_map(False)
+            self.set_resizable(False)
+            self.set_keep_below(True)
+            self.stick()  # all workspaces
+            self.set_type_hint(Gdk.WindowTypeHint.UTILITY)
+
+            self.area = Gtk.DrawingArea()
+            self.area.connect('draw', self.on_draw)
+            self.add(self.area)
+            self.area.set_size_request(self.panel_w, h)  # non-resizable: window follows it
+            self.move(x if side == 'left' else x + w - self.panel_w, y)
+            self.connect('map-event', self.on_map)
+            self.connect('realize', lambda *_: self.get_window().set_override_redirect(False))
+
+            self.panel = Panel(cmd, EVERY[side], self.area.queue_draw)
+            GLib.timeout_add_seconds(EVERY['left'], self.tick)
+
+        def on_map(self, *_):
+            self.set_keep_below(True)
+            self.stick()
+            self.resize(self.panel_w, self.mon[3])
+            return False
+
+        def tick(self):
+            self.area.queue_draw()
+            self.set_keep_below(True)  # in case an app raise reshuffled the stack
+            return True
+
+        def fit(self, want):
+            x, y, w, h = self.mon
+            self.panel_w = min(want, w - DESK_LEFT_W)
+            self.area.set_size_request(self.panel_w, h)
+            self.resize(self.panel_w, h)
+            self.move(x + w - self.panel_w, y)
+            return False
+
+        def on_draw(self, widget, ctx):
+            alloc = widget.get_allocation()
+            ctx.set_source_rgb(*BG)
+            ctx.paint()
+            mx, my = DESK_MARGIN
+            natural, self.panel.lines = draw(ctx, self.panel.text, 0, 0,
+                                             alloc.width, alloc.height, mx, my)
+            if self.side == 'right' and self.panel.text:
+                want = natural + 2 * mx
+                if abs(min(want, self.mon[2] - DESK_LEFT_W) - alloc.width) > 4:
+                    GLib.idle_add(self.fit, want)
+            return False
+
+    mon = pick_monitor()
+    wins = [DeskPanel(side, cmd, mon) for side, cmd in (('left', args.left), ('right', args.right)) if cmd]
+    for win in wins:
+        win.connect('destroy', Gtk.main_quit)
+        win.show_all()
+        win.set_keep_below(True)
+    Gtk.main()
+
+
+def main():
+    ap = argparse.ArgumentParser(description='Draw text panels on the lock screen or desktop.')
+    ap.add_argument('--desk', action='store_true', help='desktop widgets instead of lock screen')
+    ap.add_argument('--left', metavar='CMD', help='shell command for the left panel')
+    ap.add_argument('--right', metavar='CMD', help='shell command for the right panel')
+    args = ap.parse_args()
+    log('lockin start', 'desk' if args.desk else os.environ.get('XSCREENSAVER_WINDOW'))
+    (desk if args.desk else lock)(args)
+
+
+if __name__ == '__main__':
+    main()
