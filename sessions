@@ -11,7 +11,8 @@ See README.txt.
   sessions --tsv        TAB-separated cells, fitted to $LINES (for lockin)
   sessions --watch      daemon: keep $XDG_RUNTIME_DIR/lobby-sessions current
 """
-import json, os, sqlite3, subprocess, sys, time
+import json, math, os, re, sqlite3, subprocess, sys, time
+from datetime import datetime
 
 HOME = os.path.expanduser('~')
 CONFIGS = [('claude', os.path.join(HOME, '.claude')),
@@ -24,11 +25,13 @@ RESURRECT = os.path.join(HOME, '.local/share/tmux/resurrect')
 TMUX_LOG = os.path.join(HOME, '.local/state/claude-sessions/tmux.tsv')
 NAME_MAX, CWD_MAX = 32, 40
 FAMILY_MIN = 4       # shortest name prefix that folds sessions into a family
+CHILDREN_ALL = 6     # children shown: all of n up to about this, then sqrt(CHILDREN_ALL * n)
 RUN = os.environ.get('XDG_RUNTIME_DIR')
 LIVE = RUN and os.path.join(RUN, 'lobby-sessions')   # the --watch daemon's file
 WATCH_EVERY, STALE = 10, 30   # s: daemon rewrites the file this often; older is ignored
 
 _meta_cache = {}     # transcript path -> ((mtime_ns, size), meta)
+_calls_cache = {}    # transcript path -> ((mtime_ns, size), Bash calls)
 _resurrect = {'files': set(), 'panes': {}, 'start': None}
 _tmux_log = {'key': None, 'map': {}}
 
@@ -60,9 +63,15 @@ def _scan_meta(lines, meta):
             meta.setdefault('ai', d['summary'])
 
 
+def _epoch(iso):
+    return datetime.fromisoformat(iso).timestamp()
+
+
 def _read_meta(path, size):
     meta = {}
     for d in _lines(path, 0, HEAD):
+        if d.get('timestamp') and 'start' not in meta:
+            meta['start'] = _epoch(d['timestamp'])
         if d.get('cwd'):
             meta['cwd'] = d['cwd']
             break
@@ -240,7 +249,7 @@ def _opencode(seen):
         db = sqlite3.connect(f'file:{OPENCODE_DB}?mode=ro', uri=True)
         found = db.execute(
             "SELECT s.id, s.slug, s.title, s.directory, s.time_updated, p.worktree,"
-            " s.permission IS NOT NULL FROM session s JOIN project p ON p.id = s.project_id"
+            " s.permission IS NOT NULL, s.time_created FROM session s JOIN project p ON p.id = s.project_id"
             " WHERE s.parent_id IS NULL AND s.time_archived IS NULL").fetchall()
         live = {}
         for sid, folder, started, cont, env in _opencode_tuis():
@@ -259,16 +268,96 @@ def _opencode(seen):
     except sqlite3.Error:
         return []
     rows = []
-    for sid, slug, title, folder, updated, worktree, run in found:
+    for sid, slug, title, folder, updated, worktree, run, created in found:
         if title.startswith('New session - '):
             title = ''  # opencode's placeholder until it names the session
         rows.append({
-            'cmd': 'opencode', 'id': sid, 'mtime': updated / 1000, 'cwd': folder,
+            'cmd': 'opencode', 'id': sid, 'mtime': updated / 1000, 'start': created / 1000, 'cwd': folder,
             'name': title or slug, 'ai': title, 'prompt': '', 'tmux': '', 'state': live.get(sid),
             'resume': f'cd {tilde(folder)} && opencode -s {sid}',
             'run': worktree if run else None,  # runs fold by project ('/' = none)
         })
     return rows
+
+
+# ---- parents ---------------------------------------------------------------
+# Who started a session, best evidence first:
+#  1. its folder is inside a Claude session's scratchpad /tmp/claude-<uid>/<project>/<id>/
+#  2. it ran in a tmux session that a Claude session's Bash call created
+#     (tmux new-session ... -s NAME, $vars as wildcards) before it started
+#  3. an opencode run: the deepest folder holding it, below its project's
+#     and not a shared one (/, /tmp, ~), that a Claude session's Bash call
+#     named before the run started
+# (tmux does not pass the caller's environment on, so CLAUDE_CODE_SESSION_ID
+# in a child's /proc/<pid>/environ misses most children.)
+
+_SCRATCH = re.compile(r'/tmp/claude-\d+/[^/]+/([0-9a-f-]{36})/')
+_HEREDOC = re.compile(r"<<-?\s*(['\"]?)(\w+)\1.*?\n\2\b", re.S)  # quoted text: not commands
+_TMUX_NEW = re.compile(r'\btmux\s+new(?:-session)?\b[^;&|\n]*?\s-s\s*["\']?([\w.@+${}-]+)')
+_PATH = re.compile(r'(?<![\w$}])(\bcd\s+)?["\']?([~\w.@+-]*/[\w./@+-]*)')
+
+
+def _read_calls(path):
+    """-> [(time, folder it ran in, command)] for the transcript's Bash calls."""
+    calls = []
+    with open(path, 'rb') as f:
+        for raw in f:
+            if b'"tool_use"' not in raw or b'"Bash"' not in raw:
+                continue
+            try:
+                d = json.loads(raw)
+            except ValueError:
+                continue
+            for b in d.get('message', {}).get('content') or []:
+                if isinstance(b, dict) and b.get('type') == 'tool_use' and b.get('name') == 'Bash' \
+                        and d.get('timestamp'):
+                    calls.append((_epoch(d['timestamp']), d.get('cwd') or '', b['input'].get('command', '')))
+    return calls
+
+
+def _launches(calls):
+    """Bash calls -> ([(time, regex of a tmux session it created)], {folder: first time named})."""
+    tmux, folders = [], {}
+    for t, cwd, cmd in calls:
+        cmd = _HEREDOC.sub('', cmd).replace('$PWD', cwd)
+        for m in _TMUX_NEW.finditer(cmd):
+            name = re.sub(r'\\\$(\\\{)?\w+(?(1)\\\})', '[^:]*', re.escape(m.group(1)))  # $s, ${s}: any
+            tmux.append((t, re.compile(name)))
+        base = cwd
+        for m in _PATH.finditer(cmd):
+            p = os.path.normpath(os.path.join(base, os.path.expanduser(m.group(2))))
+            if m.group(1):
+                base = p
+            folders.setdefault(p, t)
+    return tmux, folders
+
+
+def _parents(rows, launches):
+    """Set r['parent'] for the rows the evidence above names a parent for."""
+    tmux = [(t, rx, sid) for sid, (ts, _) in launches.items() for t, rx in ts]
+    named = {}
+    for sid, (_, folders) in launches.items():
+        for f, t in folders.items():
+            named.setdefault(f, []).append((t, sid))
+    for r in rows:
+        m = _SCRATCH.search(r['cwd'] + '/')
+        if m and m.group(1) != r['id']:
+            r['parent'] = m.group(1)
+            continue
+        if r['tmux'] and r['tmux'] != '?':
+            c = [(t, sid) for t, rx, sid in tmux
+                 if sid != r['id'] and t <= r['start'] and rx.fullmatch(r['tmux'])]
+            if c:
+                r['parent'] = max(c)[1]
+                continue
+        if r['run']:
+            f, shared = r['cwd'], {'/', '/tmp', HOME, os.path.dirname(HOME)}
+            while f not in shared and len(f) > len(r['run']):
+                c = [x for x in named.get(f, []) if x[0] <= r['start']]
+                if c:
+                    r['parent'] = max(c)[1]
+                    break
+                f = os.path.dirname(f)
 
 
 # ---- rows ------------------------------------------------------------------
@@ -282,6 +371,7 @@ def sessions():
     panes, since = _resurrect_panes()
     for r in rows:
         r['tmux'] = exact.get(r['id']) or ''
+    launches = {}
     for cmd, cdir in CONFIGS:
         pdir = os.path.join(cdir, 'projects')
         try:
@@ -304,9 +394,13 @@ def sessions():
                 else:
                     meta = _read_meta(e.path, st.st_size)
                     _meta_cache[e.path] = (key, meta)
+                sid = e.name[:-6]
+                hit = _calls_cache.get(e.path)
+                if not (hit and hit[0] == key):
+                    hit = _calls_cache[e.path] = (key, _launches(_read_calls(e.path)))
+                launches[sid] = hit[1]
                 if not (meta.get('custom') or meta.get('ai') or meta.get('prompt')):
                     continue  # never got a real prompt (e.g. opened and quit)
-                sid = e.name[:-6]
                 cwd = meta.get('cwd') or proj.replace('-', '/')  # lossy fallback
                 # tmux: exact name > snapshot pane with this name+cwd > exact '' >
                 # '' if snapshots were running then, else '?' (no record)
@@ -317,12 +411,14 @@ def sessions():
                 if tmux is None:
                     tmux = '' if since and st.st_mtime >= since else '?'
                 rows.append({
-                    'cmd': cmd, 'id': sid, 'mtime': st.st_mtime, 'cwd': cwd,
+                    'cmd': cmd, 'id': sid, 'mtime': st.st_mtime, 'start': meta.get('start', st.st_mtime),
+                    'cwd': cwd,
                     'name': meta.get('custom') or meta.get('ai') or sid[:8],
                     'ai': meta.get('ai') or '', 'prompt': meta.get('prompt') or '',
                     'tmux': tmux, 'state': live.get(sid),
                     'resume': f'cd {tilde(cwd)} && {cmd} --resume {sid}', 'run': None,
                 })
+    _parents(rows, launches)
     rows.sort(key=lambda r: r['mtime'], reverse=True)
     return rows
 
@@ -349,29 +445,66 @@ def families(names):
 
 
 def folded(rows):
-    """Fold sessions into families: opencode runs by project, the rest by
-    families(). A family is one row (the running one, else the newest) with
-    the newest time, a count, and the family's name with "-*" if its
-    members' names differ."""
+    """Fold sessions into families: opencode runs by project (as "runs"
+    when more than one), the rest by families(). A family is one row (the
+    running one, else the newest) with the newest time, a count, and the
+    family's name with "-*" if its members' names differ."""
     fam = families({r['name'] for r in rows if not r['run']})
     groups = {}
     for r in rows:  # newest first
         k = ('runs', r['run']) if r['run'] else fam[r['name']]
         g = groups.get(k)
         if g is None:
-            groups[k] = g = dict(r, n=1, names={r['name']})
+            groups[k] = g = dict(r, n=1, names={r['name']}, ids=[r['id']])
         else:
             g['n'] += 1
             g['names'].add(r['name'])
+            g['ids'].append(r['id'])
             if r['state'] and not g['state']:
-                g.update(r, n=g['n'], names=g['names'], mtime=g['mtime'])
+                g.update(r, n=g['n'], names=g['names'], ids=g['ids'], mtime=g['mtime'])
     for k, g in groups.items():
         names = g.pop('names')
-        if g['run']:
+        if g['run'] and g['n'] > 1:
             g.update(name='runs', cwd=g['run'] if g['run'] != '/' else g['cwd'])
         elif len(names) > 1:
             g['name'] = k + '-*'
     return list(groups.values())
+
+
+def shown(n):
+    """Children shown of n: all up to about CHILDREN_ALL, then a share that
+    falls as sqrt(CHILDREN_ALL / n)."""
+    return min(n, math.ceil(math.sqrt(CHILDREN_ALL * n)))
+
+
+def tree(rows, fold=True):
+    """-> [(depth, row)]: rows without a parent among rows, folded, then
+    under each its children (of all its members) likewise, at most shown()
+    of them and a {'more': N} row for the rest. A row's time is the newest
+    in its subtree. fold=False: no folding, every child."""
+    kids, ids = {}, {r['id'] for r in rows}
+    for r in rows:
+        if r.get('parent') in ids:
+            kids.setdefault(r['parent'], []).append(r)
+
+    def newest(r, seen=()):
+        return max([r['mtime']] + [newest(c, seen + (r['id'],)) for c in kids.get(r['id'], [])
+                                   if c['id'] not in seen])
+
+    def level(rs, depth, seen):
+        rs = sorted((dict(r, mtime=newest(r)) for r in rs if r['id'] not in seen),
+                    key=lambda r: r['mtime'], reverse=True)
+        groups = folded(rs) if fold else [dict(r, ids=[r['id']]) for r in rs]
+        take = shown(len(groups)) if fold and depth else len(groups)
+        out = []
+        for g in groups[:take]:
+            out.append((depth, g))
+            out += level([c for i in g['ids'] for c in kids.get(i, [])], depth + 1, seen | set(g['ids']))
+        if take < len(groups):
+            out.append((depth, {'more': len(groups) - take}))
+        return out
+
+    return level([r for r in rows if r.get('parent') not in ids], 0, frozenset())
 
 
 def load(fresh=False):
@@ -437,8 +570,12 @@ def when(ts, now=None):
     return time.strftime('%d %b', t).lstrip('0')
 
 
-def cells(r, now=None):
+def cells(r, now=None, depth=0):
+    indent = '  ' * (depth - 1) + '· ' if depth else ''
+    if 'more' in r:
+        return ['  ', '', f"{indent}+{r['more']} more", '', '', '']
     name = r['name'] if len(r['name']) <= NAME_MAX else r['name'][:NAME_MAX - 1] + '…'
+    name = indent + name
     if r.get('n', 1) > 1:
         name += f" ({r['n']})"
     tmux = r['tmux'] if r['tmux'] != '?' else ''  # '?' is said once, in the header
@@ -448,13 +585,14 @@ def cells(r, now=None):
 
 
 def table(rows, since, max_lines=None, limit=25, now=None):
-    """-> lines: str (header, blank) or (cells, row) for a session.
-    max_lines fits the panel height (at least one row); else limit rows (0 = all)."""
+    """rows: tree(). -> lines: str (header, blank) or (cells, row) for a
+    session. max_lines fits the panel height (at least one row); else limit
+    rows (0 = all)."""
     take = max(1, max_lines - 2) if max_lines is not None else limit or None
     head = 'SESSIONS  -  by last activity'
     if since:
         head += '  -  tmux recorded since ' + when(since, now)
-    return [head, ''] + ([(cells(r, now), r) for r in rows[:take]] or ['  (none)'])
+    return [head, ''] + ([(cells(r, now, d), r) for d, r in rows[:take]] or ['  (none)'])
 
 
 def main(argv):
@@ -477,9 +615,13 @@ def main(argv):
             terms.append(a.lower())
     rows, since, _ = load()
     if terms:
-        rows = [r for r in rows if matches(r, terms)]
-    if not unfold:
-        rows = folded(rows)
+        by_id = {r['id']: r for r in rows}
+
+        def kept(r, seen=()):  # it or an ancestor matches
+            p = by_id.get(r.get('parent'))
+            return matches(r, terms) or bool(p) and p['id'] not in seen and kept(p, seen + (r['id'],))
+        rows = [r for r in rows if kept(r)]
+    rows = tree(rows, fold=not unfold)
     lines_env = os.environ.get('LINES', '') if tsv else ''
     lines = table(rows, since, max_lines=int(lines_env) if lines_env.isdigit() else None,
                   limit=n)
@@ -497,7 +639,7 @@ def main(argv):
             print('\t'.join(c))
         else:
             print('   '.join(x.ljust(width[i]) for i, x in enumerate(c)).rstrip())
-        if resume:
+        if resume and 'resume' in r:
             print('     ' + r['resume'])
     return 0
 

@@ -28,9 +28,11 @@ NOT_RUNNING = 4194305  # above Linux's largest pid, so never alive
 EXAMPLE = """\
 SESSIONS  -  by last activity  -  tmux recorded since Wed 18:52
 
-  11:35       claude       SITE-DEPLOY   idle   tmux=web   cwd=~/src/site
-  10:02       claude-alt   XTAL-* (3)    busy              cwd=~/stage
-  Tue 09:14   opencode     runs (40)                       cwd=~/src/lab
+  11:35       claude       SITE-DEPLOY    idle   tmux=web   cwd=~/src/site
+  10:02       claude-alt   XTAL-* (3)     busy              cwd=~/stage
+  Tue 09:14   claude       LAB                              cwd=~/src/lab
+  Tue 09:14   opencode     · runs (40)                      cwd=~/src/lab
+  Mon 17:02   claude       · lab-replay          tmux=r1    cwd=~/src/lab
 """
 RUN_PERMISSION = json.dumps([{"permission": "question", "pattern": "*", "action": "deny"}])
 
@@ -91,11 +93,15 @@ class Case(unittest.TestCase):
         return str(self.home) + folder[1:] if folder.startswith("~") else folder
 
     def session(self, config, name=None, ai=None, prompt=None, cwd="~/proj", mtime=None,
-                sid=None):
-        """A transcript <config>/projects/<cwd>/<sid>.jsonl modified at mtime."""
+                sid=None, start=None, calls=()):
+        """A transcript <config>/projects/<cwd>/<sid>.jsonl modified at mtime,
+        started at start, with Bash tool calls (time, command) run in cwd."""
         sid = sid or str(uuid.uuid4())
         cwd = self.expand(cwd)
-        lines = [{"type": "user", "cwd": cwd}]
+        iso = lambda ts: datetime.fromtimestamp(ts, timezone.utc).isoformat().replace("+00:00", "Z")
+        lines = [dict({"type": "user", "cwd": cwd}, **({"timestamp": iso(start)} if start else {}))]
+        lines += [{"type": "assistant", "cwd": cwd, "timestamp": iso(t), "message": {"content": [
+            {"type": "tool_use", "name": "Bash", "input": {"command": c}}]}} for t, c in calls]
         for kind, key, value in (("custom-title", "customTitle", name),
                                  ("ai-title", "aiTitle", ai),
                                  ("last-prompt", "lastPrompt", prompt)):
@@ -126,7 +132,7 @@ class Case(unittest.TestCase):
         (folder / f"{pid}.json").write_text(json.dumps(data))
 
     def oc_session(self, title="", slug="calm-river", cwd="~/proj", mtime=None, run=False,
-                   worktree="/", sid=None, last=None):
+                   worktree="/", sid=None, last=None, start=None):
         """A top-level opencode session in opencode.db; last is the data of
         its newest message, if any."""
         sid = sid or "ses_" + uuid.uuid4().hex
@@ -136,13 +142,14 @@ class Case(unittest.TestCase):
             "CREATE TABLE IF NOT EXISTS project (id TEXT PRIMARY KEY, worktree TEXT);"
             "CREATE TABLE IF NOT EXISTS session (id TEXT PRIMARY KEY, project_id TEXT, parent_id TEXT,"
             " slug TEXT, directory TEXT, title TEXT, permission TEXT, time_updated INTEGER,"
-            " time_archived INTEGER);"
+            " time_archived INTEGER, time_created INTEGER);"
             "CREATE TABLE IF NOT EXISTS message (id TEXT PRIMARY KEY, session_id TEXT,"
             " time_created INTEGER, data TEXT);")
         db.execute("INSERT OR IGNORE INTO project VALUES (?, ?)", (worktree, self.expand(worktree)))
-        db.execute("INSERT INTO session VALUES (?, ?, NULL, ?, ?, ?, ?, ?, NULL)",
+        mtime = mtime or self.at("09:00", 10)
+        db.execute("INSERT INTO session VALUES (?, ?, NULL, ?, ?, ?, ?, ?, NULL, ?)",
                    (sid, worktree, slug, self.expand(cwd), title, RUN_PERMISSION if run else None,
-                    int((mtime or self.at("09:00", 10)) * 1000)))
+                    int(mtime * 1000), int((start or mtime) * 1000)))
         if last:
             db.execute("INSERT INTO message VALUES (?, ?, 1, ?)", ("msg_" + sid, sid, json.dumps(last)))
         db.commit()
@@ -227,16 +234,24 @@ class SessionsTest(Case):
         self.pid_file(self.alt, xtal, status="busy", run=True)
         self.session(self.alt, name="XTAL-PILOT", cwd="~/stage/p", mtime=self.at("08:00", 3))
         self.session(self.main, name="XTAL-REPLAY-B", cwd="~/stage", mtime=self.at("08:00", 4))
+        t0 = self.at("09:00", 5)
+        self.session(self.main, name="LAB", cwd="~/src/lab", start=t0, mtime=self.at("12:00", 4), calls=[
+            (t0 + 60, "cd ~/src/lab && tmux new -d -s r1 claude && node run.js --dir ./calls")])
+        replay = self.session(self.main, ai="lab-replay", cwd="~/src/lab", start=t0 + 120,
+                              mtime=self.at("17:02", 3))
+        self.pid_file(self.main, replay, tmux="r1:@1.%1")
         for i in range(40):
-            self.oc_session(title=f"judge-{i}", cwd=f"~/src/lab/calls/{i}", run=True,
+            self.oc_session(title=f"judge-{i}", cwd=f"~/src/lab/calls/{i}", run=True, start=t0 + 180,
                             worktree="~/src/lab", mtime=self.at("09:14", 2) - i * 60)
         expected = EXAMPLE.replace("since Wed", f"since {self.ddd(1)}").replace(
-            "Tue 09:14", f"{self.ddd(2)} 09:14")
+            "Tue 09:14", f"{self.ddd(2)} 09:14").replace("Mon 17:02", f"{self.ddd(3)} 17:02")
         self.assertEqual(self.run_cs(), expected, self.r.stderr)
         lines = expected.split("\n")
-        lines[2:5] = ["  11:35\tclaude\tSITE-DEPLOY\tidle\ttmux=web\tcwd=~/src/site",
+        lines[2:7] = ["  11:35\tclaude\tSITE-DEPLOY\tidle\ttmux=web\tcwd=~/src/site",
                       "  10:02\tclaude-alt\tXTAL-* (3)\tbusy\t\tcwd=~/stage",
-                      f"  {self.ddd(2)} 09:14\topencode\truns (40)\t\t\tcwd=~/src/lab"]
+                      f"  {self.ddd(2)} 09:14\tclaude\tLAB\t\t\tcwd=~/src/lab",
+                      f"  {self.ddd(2)} 09:14\topencode\t· runs (40)\t\t\tcwd=~/src/lab",
+                      f"  {self.ddd(3)} 17:02\tclaude\t· lab-replay\t\ttmux=r1\tcwd=~/src/lab"]
         self.assertEqual(self.run_cs("--tsv"), "\n".join(lines), self.r.stderr)
 
     def test_tsv_fits_to_LINES(self):
@@ -349,6 +364,48 @@ class SessionsTest(Case):
             r2, f"     cd {srv} && claude --resume {o}",
             r3, f"     cd ~/notes && claude-alt --resume {a}",
             r4, f"     cd ~/oc && opencode -s {c}", ""]), self.r.stderr)
+
+    def test_parents(self):
+        t0 = self.at("08:00")
+        boss = self.session(self.main, name="BOSS", cwd="~/stage", mtime=self.at("09:00"), start=t0, calls=[
+            (t0 + 60, "for s in a b; do tmux new-session -d -s loop-$s -c ~/lab 'node loop.js'; done"),
+            (t0 + 70, "cd ~/lab && node launch.js --dir experiments/x"),
+            (t0 + 80, "python3 - <<'EOF'\nprint('tmux new-session -s quoted')\nEOF"),
+            (t0 + 90, "ls ~/lab")])
+        before = self.session(self.main, name="early", start=t0 + 30, mtime=self.at("08:30"))
+        self.pid_file(self.main, before, tmux="loop-a:@1.%1")  # started before loop-a was made
+        after = self.session(self.main, name="worker", start=t0 + 100, mtime=self.at("08:40"))
+        self.pid_file(self.main, after, tmux="loop-b:@1.%1")
+        quoted = self.session(self.main, name="quoted-only", start=t0 + 100, mtime=self.at("08:35"))
+        self.pid_file(self.main, quoted, tmux="quoted:@1.%1")
+        scratch = f"/tmp/claude-1000/-home-me-stage/{boss}/scratchpad/w"
+        self.oc_session(title="in scratchpad", cwd=scratch, run=True, start=t0 + 100, mtime=self.at("08:20"))
+        self.oc_session(title="in experiment", cwd="~/lab/experiments/x/0001/cwd", run=True, worktree="~/lab",
+                        start=t0 + 100, mtime=self.at("08:10"))
+        self.oc_session(title="only root named", cwd="~/lab/other", run=True, worktree="~/lab",
+                        start=t0 + 100, mtime=self.at("08:05"))
+        rows = [l.split("\t")[2] for l in self.run_cs("--tsv", "-u").splitlines() if "\t" in l]
+        self.assertEqual(rows, ["BOSS", "· worker", "· in scratchpad", "· in experiment",
+                                "quoted-only", "early", "only root named"], self.r.stderr)
+        self.assertEqual(names(self.run_cs("--tsv", "boss")),
+                         ["BOSS", "· worker", "· in scratchpad", "· in experiment"],
+                         "a word keeps the descendants of a match")
+        self.assertEqual(self.run_cs("--tsv", "boss").splitlines()[2].split("\t")[0], "  09:00",
+                         "a parent's time is the newest in its subtree")
+
+    def test_children_shown(self):
+        t0 = self.at("08:00")
+        for n, want in ((7, 7), (10, 8), (24, 12)):
+            with self.subTest(children=n):
+                shutil.rmtree(self.main, ignore_errors=True)
+                self.session(self.main, name="BOSS", start=t0, calls=[(t0 + 1, "tmux new -s w-$i 'claude'")],
+                             mtime=self.at("07:00"))
+                for i in range(n):
+                    c = self.session(self.main, ai=f"child{i}", start=t0 + 10, mtime=self.at("06:00") - i * 60)
+                    self.pid_file(self.main, c, tmux=f"w-{i}:@1.%1")
+                out = names(self.run_cs("--tsv", "-n", "0"))
+                self.assertEqual(out, ["BOSS"] + [f"· child{i}" for i in range(want)]
+                                 + ([f"· +{n - want} more"] if want < n else []))
 
     def test_running_opencode_tui(self):
         fake_tmux = self.tmp / "bin2" / "tmux"

@@ -206,7 +206,7 @@ that resumes it:
 A source that does not exist adds no rows.
 
   -n N      at most N rows; default 25, 0 means all
-  -u        no folding: one row per session
+  -u        no folding: one row per session, every child shown
   -r        under each row, the command that resumes that session:
               "     cd <folder> && claude --resume <id>"  (or claude-alt)
               "     cd <folder> && opencode -s <id>"
@@ -216,8 +216,9 @@ A source that does not exist adds no rows.
             $LINES is set, the output is fitted to that many lines and -n
             is ignored. Resume lines (-r) are not counted.
   WORD...   keep only sessions whose name, auto title, last prompt, folder
-            or session id contain every WORD, ignoring case. Folding is
-            done after, over the sessions kept.
+            or session id contain every WORD, ignoring case, and the
+            descendants of those (Parents). Folding is done after, over the
+            sessions kept.
   --watch   run until killed, writing the daemon file at start and then
             every 10 s (below).
             sessions.service runs this.
@@ -235,21 +236,50 @@ Example (invented sessions):
 
   SESSIONS  -  by last activity  -  tmux recorded since Wed 18:52
 
-    11:35       claude       SITE-DEPLOY         idle   tmux=web   cwd=~/src/site
-    10:02       claude-alt   XTAL-* (3)          busy              cwd=~/stage
-    Tue 09:14   opencode     runs (40)                             cwd=~/src/lab
+    11:35       claude       SITE-DEPLOY    idle   tmux=web   cwd=~/src/site
+    10:02       claude-alt   XTAL-* (3)     busy              cwd=~/stage
+    Tue 09:14   claude       LAB                              cwd=~/src/lab
+    Tue 09:14   opencode     · runs (40)                      cwd=~/src/lab
+    Mon 17:02   claude       · lab-replay          tmux=r1    cwd=~/src/lab
 
 Lines, in order:
   - Header: "SESSIONS  -  by last activity". If any tmux-resurrect snapshot
     exists it continues "  -  tmux recorded since " and the time in the
     oldest snapshot's file name, in the time format below.
-  - A blank line, then one row per session or family, newest first, or
-    "  (none)" if there are none.
+  - A blank line, then the rows as a tree (Parents): one row per session or
+    family without a parent, newest first, each followed by its children,
+    or "  (none)" if there are none.
+
+Parents. A session's parent is the Claude session that started it, from
+this evidence, best first:
+  1. Its folder is inside that session's scratchpad,
+     /tmp/claude-<uid>/<project>/<session id>/.
+  2. Its tmux session (the tmux cell) is one that a Bash call of that
+     session created, `tmux new-session ... -s NAME` (or `tmux new`), at or
+     before this session's start; $var and ${var} in NAME match anything
+     but ":". The latest such call wins.
+  3. For an opencode run: the deepest folder holding the run's folder, but
+     deeper than its project's folder and not /, /tmp, $HOME or the folder
+     above $HOME, that a Bash call of that session named at or before the
+     run's start. The latest such call wins.
+In Bash calls, heredoc bodies are skipped; a path is a word containing
+"/", read relative to the call's folder and to the folders it cd's into,
+with $PWD as the call's folder. A session's start is the first timestamp in its transcript (Claude)
+or its time_created (opencode). tmux does not pass the caller's environment
+to the sessions it creates, so environment variables are not used.
+
+Children follow their parent's row, folded among themselves, newest
+first, their name cell indented: "· " for children, "  · " for theirs, and
+so on. A family's children are the children of all its members. Of n child
+rows at most ceil(sqrt(6 x n)) are shown (all of up to 7; 8 of 10; 12 of
+24); a row "+<rest> more" stands for the others. A row's time, and its
+place in the order, is the newest last activity in its subtree.
 
 Folding. Sessions are folded into families, one row each:
   - opencode sessions started by `opencode run` (scripted, not the TUI)
-    fold by project, as "runs". Their folder cell is the project's folder
-    (for opencode's global project, the shown session's folder).
+    fold by project, as "runs" when more than one. Their folder cell is the
+    project's folder (for opencode's global project, the shown session's
+    folder).
   - Every other session belongs to the family of its name. A name's
     prefix is its first one or more parts when split at "-", e.g. XTAL and
     XTAL-PILOT for XTAL-PILOT-B. Take the longest prefix, at least 4
@@ -264,9 +294,9 @@ newest; its time is the newest's. Its name is the family's name, with "-*"
 added if its sessions' names are not all the same.
 
 Row cells, in order:
-  1. two spaces and the time of last activity: for Claude, the transcript
-     file's modification time; for opencode, the session's time_updated;
-     in local time.
+  1. two spaces and the time of last activity (of the row's subtree, see
+     Parents): for Claude, the transcript file's modification time; for
+     opencode, the session's time_updated; in local time.
        same day as now          HH:MM          11:35
        less than 6 x 24 h ago   Ddd HH:MM      Tue 09:14
        older                    D Mon          3 Oct
@@ -274,7 +304,8 @@ Row cells, in order:
   3. name: for Claude, the /rename name, else Claude's auto title, else the
      first 8 characters of the session id; for opencode, its title, else
      its slug; for a family, as in Folding. Over 32 characters: the first
-     31 and "…". Then " (N)" when the row folds N > 1 sessions.
+     31 and "…". Then " (N)" when the row folds N > 1 sessions. Children
+     are indented (Parents).
   4. state of a running session: its status, e.g. busy, idle, waiting, or
      "live" if it has none. Empty if not running.
   5. "tmux=<tmux session>" if the session ran inside tmux, else empty.
@@ -287,7 +318,8 @@ output, columns are separated by three spaces, and trailing spaces are
 removed. --tsv: cells joined by one TAB, empty cells kept.
 
 Fitting to $LINES (--tsv): the header and blank line count; the rest are
-rows, at least one even if that makes the output longer than $LINES.
+rows of the tree in order, at least one even if that makes the output
+longer than $LINES.
 
 Where the data comes from
   <config>/projects/<anything>/<session id>.jsonl
@@ -300,6 +332,10 @@ Where the data comes from
         {"type": "last-prompt", "lastPrompt": "…"}     last prompt
       Later title and prompt lines replace earlier ones. If no line has a
       cwd, the folder is the <anything> folder name with "-" read as "/".
+        {"timestamp": "…", ...}                       start (first one)
+        {"type": "assistant", "cwd": "…", "timestamp": "…", "message":
+         {"content": [{"type": "tool_use", "name": "Bash",
+                       "input": {"command": "…"}}]}}  Bash calls (Parents)
   <config>/sessions/<pid>.json
       Written by Claude while it runs: {"pid": 123, "sessionId": "…",
       "procStart": "<field 22 of /proc/<pid>/stat>", "status": "idle",
@@ -314,8 +350,8 @@ Where the data comes from
       a status symbol, a space, and the session name.
   ~/.local/share/opencode/opencode.db
       opencode's SQLite database, opened read-only. Used: table session
-      (id, slug, title, directory, time_updated, permission, parent_id,
-      time_archived), project (worktree) and message (the newest one's
+      (id, slug, title, directory, time_created, time_updated, permission,
+      parent_id, time_archived), project (worktree) and message (the newest one's
       role and time.completed). Sessions with a parent_id (subagents) or
       time_archived are ignored. A title starting "New session - " is
       opencode's placeholder and counts as none. A session with a

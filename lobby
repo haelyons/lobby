@@ -46,9 +46,9 @@ def ssh_rows(text):
     return rows, tmux
 
 
-def session_cells(r, now):
+def session_cells(r, now, depth):
     """sessions' row cells without their prefixes."""
-    when, tool, name, state, tmux, cwd = cs.cells(r, now)
+    when, tool, name, state, tmux, cwd = cs.cells(r, now, depth)
     return [when.lstrip(), tool, name, state, tmux.removeprefix('tmux='), cwd.removeprefix('cwd=')]
 
 
@@ -110,7 +110,7 @@ def main(argv):
         # room for rows: all but the header row and the blank + footer below
         take = max(1, height - len(out) - 1 - 2)
         body = [['SESSIONS', 'TOOL', 'NAME', 'STATE', 'TMUX', 'CWD']]
-        body += [session_cells(r, now) for r in cs.folded(rows)[:take]]
+        body += [session_cells(r, now, d) for d, r in cs.tree(rows)[:take]]
         if cs.any_source():
             out += table(body) + ['']
         foot.append('sessions ' + (ago(age) if age is not None else 'fresh'))
