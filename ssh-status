@@ -2,24 +2,25 @@
 # Snapshot current SSH sessions (inbound + outbound) with remote IP + user.
 # Inbound sessions also show the interactive shell's current working directory.
 # A TMUX section lists active tmux sessions across all users.
-# Output is shown on the lock screen (xscreensaver). Runs as root.
+# Output is shown by lobby (lock screen, desktop, terminal). Runs as root.
 set -u
 
-OUT=${SSH_STATUS_OUT:-/run/ssh-status}   # override only for testing
+OUT=${SSH_STATUS_OUT:-/run/lobby-ssh}   # override only for testing
 
 # comm names we treat as "the session's interactive process" for cwd purposes
 ALLOWED_RE='^(bash|zsh|fish|sh|dash|ash|ksh|tcsh|csh|claude|node)$'
 
 # process maps, populated once per run by build_maps()
-declare -A CHILDREN CMD TTY
+declare -A CHILDREN CMD TTY USR
 
 build_maps() {
-  local pid ppid tty comm
-  while read -r pid ppid tty comm; do
+  local pid ppid tty user comm
+  while read -r pid ppid tty user comm; do
     CMD[$pid]=$comm
     TTY[$pid]=$tty
+    USR[$pid]=$user
     CHILDREN[$ppid]="${CHILDREN[$ppid]:-} $pid"
-  done < <(ps -eo pid=,ppid=,tty=,comm= 2>/dev/null)
+  done < <(ps -eo pid=,ppid=,tty=,user=,comm= 2>/dev/null)
 }
 
 # read /proc/<pid>/stat and echo the requested field:
@@ -86,34 +87,21 @@ session_cwd() { # $1=sshd pid reported by ss
   readlink "/proc/$chosen/cwd" 2>/dev/null || true
 }
 
-emit() { # $1=ss filter expression  $2=want_cwd (1=inbound, 0=outbound)
-  local any=0 line ip pid usr cwd
-  while IFS= read -r line; do
-    [ -z "$line" ] && continue
-    ip=$(awk '{print $4}' <<<"$line"); ip=${ip%:*}
-    pid=$(grep -oE 'pid=[0-9]+' <<<"$line" | head -1 | cut -d= -f2)
-    usr=""; [ -n "$pid" ] && usr=$(ps -o user= -p "$pid" 2>/dev/null | tr -d ' ')
+emit() { # $1=want_cwd (1=inbound, 0=outbound)  rest="<peer> <process>" from ss
+  local want=$1 conn ip pid usr cwd; shift
+  [ $# = 0 ] && { echo "  (none)"; return; }
+  for conn in "$@"; do
+    ip=${conn%% *}; ip=${ip%:*}
+    pid=""; [[ $conn =~ pid=([0-9]+) ]] && pid=${BASH_REMATCH[1]}
+    usr=""; [ -n "$pid" ] && usr=${USR[$pid]:-}
     cwd=""
-    [ "$2" = 1 ] && [ -n "$pid" ] && cwd=$(session_cwd "$pid")
+    [ "$want" = 1 ] && [ -n "$pid" ] && cwd=$(session_cwd "$pid")
     if [ -n "$cwd" ]; then
       printf "  %-21s user=%-8s cwd=%s\n" "$ip" "${usr:-?}" "$cwd"
     else
       printf "  %-21s user=%s\n" "$ip" "${usr:-?}"
     fi
-    any=1
-  done < <(ss -tnHp state established "$1" 2>/dev/null)
-  [ "$any" = 0 ] && echo "  (none)"
-}
-
-# run tmux as the socket's owning uid (passwordless when this script runs as
-# root; direct call when we already are that uid, which keeps it testable)
-tmux_as() { # $1=uid  rest=tmux args
-  local uid=$1; shift
-  if [ "$(id -u)" = "$uid" ]; then
-    tmux "$@"
-  else
-    sudo -n -u"#$uid" tmux "$@"
-  fi
+  done
 }
 
 tmux_section() {
@@ -123,14 +111,14 @@ tmux_section() {
     [ -d "$d" ] || continue
     uid=${d#/tmp/tmux-}; uid=${uid%/}
     case $uid in ''|*[!0-9]*) continue;; esac
-    user=$(getent passwd "$uid" | cut -d: -f1); user=${user:-uid$uid}
+    user=$(getent passwd "$uid"); user=${user%%:*}; user=${user:-uid$uid}
     for sock in "$d"*; do
       [ -S "$sock" ] || continue
       while IFS=$'\t' read -r name wins att; do
         [ -n "$name" ] || continue
         printf "  %-10s %-16s %s window(s), %s\n" "$user" "$name" "$wins" "$att"
         any=1
-      done < <(tmux_as "$uid" -S "$sock" list-sessions \
+      done < <(tmux -S "$sock" list-sessions \
                  -F '#{session_name}	#{session_windows}	#{?session_attached,attached,detached}' \
                  2>/dev/null)
     done
@@ -139,21 +127,27 @@ tmux_section() {
 }
 
 main() {
+  # one ss call for both directions; ps after it, so its pids are in the maps
+  local inbound=() outbound=() _ here peer proc
+  while read -r _ _ here peer proc; do
+    [ "${here##*:}" = 22 ] && inbound+=("$peer $proc")
+    [ "${peer##*:}" = 22 ] && outbound+=("$peer $proc")
+  done < <(ss -tnHp state established '( sport = :22 or dport = :22 )' 2>/dev/null)
   build_maps
+  umask 022
   {
-    echo "SSH SESSIONS  -  $(hostname)  -  $(date '+%F %T %Z')"
+    printf 'SSH SESSIONS  -  %s  -  %(%F %T %Z)T\n' "$HOSTNAME" -1
     echo
     echo "INBOUND   (remote -> this host:22)"
-    emit '( sport = :22 )' 1
+    emit 1 "${inbound[@]}"
     echo
     echo "OUTBOUND  (this host -> remote:22)"
-    emit '( dport = :22 )' 0
+    emit 0 "${outbound[@]}"
     echo
     echo "TMUX      (sessions across all users)"
     tmux_section
   } > "$OUT.tmp" 2>/dev/null
   mv "$OUT.tmp" "$OUT"
-  chmod 0644 "$OUT"
 }
 
 # run unless sourced (test harness sources this file to reach the functions)

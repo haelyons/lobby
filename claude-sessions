@@ -8,6 +8,7 @@ See README.txt.
   claude-sessions notes        rows whose name, auto title, last prompt, folder or id match
   claude-sessions -r notes     ...each followed by the command that resumes it
   claude-sessions --tsv        TAB-separated cells, fitted to $LINES (for lockin)
+  claude-sessions --watch      daemon: keep $XDG_RUNTIME_DIR/lobby-claude current
 """
 import json, os, sys, time
 
@@ -21,6 +22,9 @@ RESURRECT = os.path.join(HOME, '.local/share/tmux/resurrect')
 TMUX_LOG = os.path.join(HOME, '.local/state/claude-sessions/tmux.tsv')
 NAME_MAX, CWD_MAX = 32, 40
 ALT_ROWS = 5         # panel: ALT keeps up to this many rows, MAIN gets the rest
+RUN = os.environ.get('XDG_RUNTIME_DIR')
+LIVE = RUN and os.path.join(RUN, 'lobby-claude')   # the --watch daemon's file
+WATCH_EVERY, STALE = 10, 30   # s: daemon rewrites the file this often; older is ignored
 
 _meta_cache = {}     # transcript path -> ((mtime_ns, size), meta)
 _resurrect = {'files': set(), 'panes': {}, 'start': None}
@@ -150,6 +154,8 @@ def _resurrect_panes():
     except OSError:
         names = []
     r = _resurrect
+    if not r['files'] <= set(names):  # a snapshot was deleted (--watch): start over
+        r.update(files=set(), panes={}, start=None)
     for n in names:
         if n in r['files']:
             continue
@@ -240,6 +246,36 @@ def grouped(rows):
     return list(groups.values())
 
 
+def load(fresh=False):
+    """-> (grouped rows, time of the first tmux snapshot, age of the daemon
+    file, or None when the folders were read now)."""
+    if LIVE and not fresh:
+        try:
+            age = time.time() - os.stat(LIVE).st_mtime
+            if age < STALE:
+                with open(LIVE) as f:
+                    d = json.load(f)
+                if d.get('home') == HOME:
+                    return d['rows'], d['since'], age
+        except (OSError, ValueError):
+            pass
+    return grouped(sessions()), _resurrect['start'], None
+
+
+def watch():
+    """Daemon: rewrite LIVE every WATCH_EVERY s. Staying alive is what makes
+    the caches above pay off."""
+    if not LIVE:
+        sys.exit('claude-sessions --watch: $XDG_RUNTIME_DIR is not set')
+    while True:
+        start = time.monotonic()
+        data = {'home': HOME, 'rows': grouped(sessions()), 'since': _resurrect['start']}
+        with open(LIVE + '.tmp', 'w') as f:
+            json.dump(data, f)
+        os.replace(LIVE + '.tmp', LIVE)
+        time.sleep(max(0.0, start + WATCH_EVERY - time.monotonic()))
+
+
 def matches(r, terms):
     hay = ' '.join((r['name'], r['ai'], r['prompt'], r['cwd'], r['id'])).lower()
     return all(t in hay for t in terms)
@@ -279,24 +315,34 @@ def cells(r, now=None):
             'tmux=' + tmux if tmux else '', 'cwd=' + short_path(r['cwd'])]
 
 
-def table(rows, max_lines=None, per_section=25, now=None):
+def sections(rows):
+    """-> [(label, cmd, config dir, its rows)] for the config dirs that exist."""
+    return [(label, cmd, cdir, [r for r in rows if r['section'] == label])
+            for label, cmd, cdir in CONFIGS if os.path.isdir(cdir)]
+
+
+def fit(counts, room):
+    """Rows per section when room lines are left for rows: ALT up to
+    ALT_ROWS, MAIN as many as fit, then ALT the rest; at least one each."""
+    if len(counts) == 2:
+        alt = min(max(1, counts[1]), ALT_ROWS)
+        main = max(1, min(counts[0], room - alt))
+        return [main, max(1, room - main)]
+    return [max(1, room)] * len(counts)
+
+
+def table(rows, since, max_lines=None, per_section=25, now=None):
     """-> lines: str (header, section title, blank) or (cells, row) for a
     session. max_lines fits the panel height; else per_section rows (0 = all)."""
-    secs = [(label, cmd, cdir, [r for r in rows if r['section'] == label])
-            for label, cmd, cdir in CONFIGS if os.path.isdir(cdir)]
+    secs = sections(rows)
     if max_lines is not None:
         room = max_lines - 2 - 2 * len(secs) + 1   # header+blank, titles, blanks between
-        if len(secs) == 2:
-            alt = min(max(1, len(secs[1][3])), ALT_ROWS)
-            main = max(1, min(len(secs[0][3]), room - alt))
-            takes = [main, max(1, room - main)]
-        else:
-            takes = [max(1, room)] * len(secs)
+        takes = fit([len(s[3]) for s in secs], room)
     else:
         takes = [per_section or None] * len(secs)
     head = 'CLAUDE SESSIONS  -  by last activity'
-    if _resurrect['start']:
-        head += '  -  tmux recorded since ' + when(_resurrect['start'], now)
+    if since:
+        head += '  -  tmux recorded since ' + when(since, now)
     out = [head, '']
     for i, ((label, cmd, cdir, rs), take) in enumerate(zip(secs, takes)):
         if i:
@@ -316,15 +362,18 @@ def main(argv):
             resume = True
         elif a == '--tsv':
             tsv = True
+        elif a == '--watch':
+            return watch()
         elif a in ('-h', '--help'):
             print(__doc__.rstrip()); return 0
         else:
             terms.append(a.lower())
-    rows = grouped(sessions())
+    rows, since, _ = load()
     if terms:
         rows = [r for r in rows if matches(r, terms)]
-    fit = os.environ.get('LINES', '') if tsv else ''
-    lines = table(rows, max_lines=int(fit) if fit.isdigit() else None, per_section=n)
+    lines_env = os.environ.get('LINES', '') if tsv else ''
+    lines = table(rows, since, max_lines=int(lines_env) if lines_env.isdigit() else None,
+                  per_section=n)
     width = {}
     for ln in lines:
         if isinstance(ln, tuple):

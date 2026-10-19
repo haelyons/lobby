@@ -1,0 +1,132 @@
+#!/usr/bin/env python3
+"""lobby: SSH, tmux and Claude sessions as tables sized to the terminal,
+from what the daemons last wrote. See README.txt.
+
+  lobby [ssh] [tmux] [claude] [--fresh]
+
+  ssh       SSH connections in and out     /run/lobby-ssh
+  tmux      tmux sessions of all users     /run/lobby-ssh
+  claude    Claude Code sessions           claude-sessions daemon
+  --fresh   Claude sessions read now, not from the daemon
+
+  No word: all three.
+"""
+import importlib.util, os, re, shutil, sys, time
+from importlib.machinery import SourceFileLoader
+
+SSH = os.environ.get('SSH_STATUS_OUT') or '/run/lobby-ssh'
+
+# claude-sessions is a script, not a module: load it from next to this file
+_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'claude-sessions')
+_loader = SourceFileLoader('claude_sessions', _path)
+cs = importlib.util.module_from_spec(importlib.util.spec_from_loader(_loader.name, _loader))
+_loader.exec_module(cs)
+
+
+def ssh_rows(text):
+    """ssh-status snapshot -> (SSH rows, TMUX rows) as lists of cells."""
+    conns, tmux, sec = {}, [], ''
+    for line in text.splitlines():
+        if not line.startswith('  '):
+            sec = line.split(' ', 1)[0]  # INBOUND, OUTBOUND, TMUX (or header/blank)
+        elif sec in ('INBOUND', 'OUTBOUND'):
+            m = re.match(r'  (\S+) +user=(\S*)(?: +cwd=(.*))?$', line)
+            if m:
+                ip, user, cwd = m.groups()
+                row = ('in' if sec == 'INBOUND' else 'out', ip,
+                       '' if user == '?' else user, cs.tilde(cwd) if cwd else '')
+                conns[row] = conns.get(row, 0) + 1  # equal rows: one, counted
+        elif sec == 'TMUX':
+            m = re.match(r'  (\S+) +(.+?) +(\d+) window\(s\), (attached|detached)$', line)
+            if m:
+                user, name, wins, att = m.groups()
+                tmux.append([user, name, wins, 'yes' if att == 'attached' else 'no'])
+    rows = [[d, ip + (f' ({n})' if n > 1 else ''), user, cwd]
+            for (d, ip, user, cwd), n in conns.items()]
+    return rows, tmux
+
+
+def claude_cells(r, now):
+    """claude-sessions' row cells without their prefixes."""
+    when, name, state, tmux, cwd = cs.cells(r, now)
+    return [when.lstrip(), name, state, tmux.removeprefix('tmux='), cwd.removeprefix('cwd=')]
+
+
+def table(rows):
+    """[header, rows...] -> lines. Rows are lists of cells, or str lines
+    (section labels, "(none)") that pass through and set no widths."""
+    cells = [[c or '-' for c in r] for r in rows if not isinstance(r, str)]
+    if len(cells) == 1 and len(rows) == 1:
+        return [f'  {cells[0][0]}  (none)']
+    widths = [max(len(r[i]) for r in cells) for i in range(len(cells[0]))]
+    it = iter(cells)
+    return [r if isinstance(r, str) else
+            ('  ' + '  '.join(c.ljust(w) for c, w in zip(next(it), widths))).rstrip()
+            for r in rows]
+
+
+def ago(secs):
+    s = max(0, int(secs))
+    return f'{s}s ago' if s < 60 else f'{s // 60}m ago' if s < 3600 else f'{s // 3600}h ago'
+
+
+def main(argv):
+    fresh = False
+    want = set()
+    for a in argv:
+        if a == '--fresh':
+            fresh = True
+        elif a in ('ssh', 'tmux', 'claude'):
+            want.add(a)
+        elif a in ('-h', '--help', '--usage'):
+            print(__doc__.rstrip()); return 0
+        else:
+            sys.exit(f'lobby: unknown argument {a} (see lobby --usage)')
+    want = want or {'ssh', 'tmux', 'claude'}
+    width, height = shutil.get_terminal_size()
+    now = time.time()
+    t = time.localtime(now)
+    out = [f"lobby   {os.uname().nodename}   {time.strftime('%a', t)} {t.tm_mday} "
+           f"{time.strftime('%b %H:%M', t)}", '']
+
+    foot = []
+    if want & {'ssh', 'tmux'}:
+        try:
+            with open(SSH) as f:
+                text = f.read()
+            foot.append('ssh ' + ago(now - os.stat(SSH).st_mtime))
+        except OSError:
+            text = None
+            foot.append('no ' + SSH)
+        if text is not None:
+            conns, tmux = ssh_rows(text)
+            if 'ssh' in want:
+                out += table([['SSH', 'REMOTE', 'USER', 'CWD']] + conns) + ['']
+            if 'tmux' in want:
+                out += table([['TMUX', 'SESSION', 'WINDOWS', 'ATTACHED']] + tmux) + ['']
+
+    if 'claude' in want:
+        rows, since, age = cs.load(fresh)
+        secs = cs.sections(rows)
+        if secs:
+            # room for rows: all but the header row, later sections' blank +
+            # label, and the blank + footer below
+            room = height - len(out) - 1 - 2 * (len(secs) - 1) - 2
+            body = [[secs[0][1].upper(), 'NAME', 'STATE', 'TMUX', 'CWD']]
+            for i, ((_, cmd, _, rs), take) in enumerate(zip(secs, cs.fit([len(s[3]) for s in secs], room))):
+                if i:
+                    body += ['', '  ' + cmd.upper()]
+                body += [claude_cells(r, now) for r in rs[:take]] or ['  (none)']
+            out += table(body) + ['']
+        foot.append('claude ' + (ago(age) if age is not None else 'fresh'))
+        if since:
+            foot.append('tmux since ' + cs.when(since, now))
+    out.append('  ' + '   '.join(foot))
+
+    for line in out:
+        print(line if len(line) <= width else line[:width - 1] + '…')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

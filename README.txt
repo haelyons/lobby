@@ -1,32 +1,44 @@
-lobby — who is around on an X11 box, shown on the lock screen and desktop
-==========================================================================
+lobby — who is around on an X11 box: lock screen, desktop and terminal
+======================================================================
 
 Part of lore: small tools grown on one Linux box, made portable.
 
 WHAT THIS IS
 ------------
 lobby draws plain-text panels onto the xscreensaver lock screen and onto the
-desktop. A panel is whatever a command prints, refreshed every few seconds.
+desktop, and prints the same information as tables in a terminal. A panel is
+whatever a command prints, refreshed every few seconds.
 
+  ssh-status        daemon: SSH sessions in and out, and tmux sessions,
+                    written to /run/lobby-ssh
+  claude-sessions   every Claude Code session, newest first; with --watch,
+                    a daemon that keeps $XDG_RUNTIME_DIR/lobby-claude current
   lockin            the renderer: lock screen, or desktop with --desk
-  ssh-status        panel: SSH sessions in and out, and tmux sessions
-  claude-sessions   panel: every Claude Code session, newest first
+  lobby             everything at once, as tables for a terminal
 
-The look is fixed on purpose: one serif font, one colour, text only.
+The two daemons are the information layer. Panels and the terminal read what
+they last wrote, so the screens are optional.
+
+The look of the panels is fixed on purpose: one serif font, one colour, text
+only.
 
 REQUIREMENTS
 ------------
-- X11 and xscreensaver. A GNOME/Wayland lock screen cannot run this.
-- python3 3.11+, PyGObject with GTK 3, pycairo:
+- python3 3.11+.
+- lockin only: X11 and xscreensaver (a GNOME/Wayland lock screen cannot run
+  this), PyGObject with GTK 3, pycairo:
     sudo apt install python3-gi python3-gi-cairo gir1.2-gtk-3.0 xscreensaver \
                      x11-xserver-utils
 - Font "Crimson Text" (SIL OFL). Without it another serif is used.
-- ssh-status runs as root: only root sees other users' sshd processes.
+- ssh-status runs as root: only root sees other users' sshd processes and
+  tmux servers.
 - Tests: Xvfb (sudo apt install xvfb).
 
 INSTALL
 -------
-  install -m 0755 lockin claude-sessions ~/.local/bin/
+  install -m 0755 lockin lobby claude-sessions ~/.local/bin/
+  install -D -m 0644 claude-sessions.service ~/.config/systemd/user/claude-sessions.service
+  systemctl --user enable --now claude-sessions
   sudo install -m 0755 ssh-status /usr/local/bin/ssh-status
   sudo install -m 0644 ssh-status.service /etc/systemd/system/
   sudo systemctl enable --now ssh-status
@@ -37,7 +49,7 @@ Lock screen, in ~/.xscreensaver (full paths; it runs through /bin/sh):
 
   mode:       one
   programs:   /home/me/.local/bin/lockin                                 \
-                --left 'cat /run/ssh-status'                             \
+                --left 'cat /run/lobby-ssh'                              \
                 --right '/home/me/.local/bin/claude-sessions --tsv'      \
                 2>>/home/me/.local/share/lockin.log                      \n
 
@@ -46,7 +58,7 @@ Desktop, ~/.config/autostart/lockin.desktop:
   [Desktop Entry]
   Type=Application
   Name=lockin
-  Exec=/home/me/.local/bin/lockin --desk --left "cat /run/ssh-status" --right "/home/me/.local/bin/claude-sessions --tsv"
+  Exec=/home/me/.local/bin/lockin --desk --left "cat /run/lobby-ssh" --right "/home/me/.local/bin/claude-sessions --tsv"
 
 LOCKIN
 ------
@@ -92,9 +104,103 @@ Panels, everywhere:
   - If a run exits non-zero, the panel keeps the last good text. Before any
     good run it shows: (CMD failed: exit N)
 
+LOBBY
+-----
+  lobby [ssh] [tmux] [claude] [--fresh]
+  lobby --usage | --help | -h
+
+Prints SSH sessions, tmux sessions and Claude sessions as tables sized to
+the terminal. SSH and tmux come from /run/lobby-ssh as ssh-status wrote it
+($SSH_STATUS_OUT overrides the path). Claude sessions come the way
+claude-sessions gets them: from its daemon file when that is current, else
+read now (see CLAUDE-SESSIONS). --fresh always reads them now. lobby must be
+in the same folder as claude-sessions: it loads it.
+
+The words ssh, tmux and claude each pick one table; none means all three.
+Picked tables keep their usual order whatever the order of the words, and
+the footer keeps only the parts about them: "ssh <age>" (or "no <path>")
+goes with ssh and tmux, "claude <age>" (or "claude fresh") and "tmux since"
+with claude. A repeated word counts once. --usage, --help and -h print a
+short usage on standard output, a few lines naming each word, what it shows
+and where it comes from, and exit 0 without printing tables. Any other
+argument is an error (exit status not 0).
+
+Example (invented sessions):
+
+  lobby   box   Thu 16 Oct 11:40
+
+    SSH  REMOTE        USER  CWD
+    in   10.0.0.7      me    ~/src/site
+    out  10.0.0.9 (2)  me    -
+
+    TMUX  SESSION  WINDOWS  ATTACHED
+    me    web      2        yes
+    me    notes    1        no
+
+    CLAUDE     NAME         STATE  TMUX  CWD
+    11:35      SITE-DEPLOY  idle   web   ~/src/site
+    Tue 09:14  notes (3)    -      -     ~/notes
+
+    CLAUDE-ALT
+    (none)
+
+    ssh 2s ago   claude 4s ago   tmux since Wed 18:52
+
+Lines, in order:
+  - "lobby", this machine's host name (as uname -n prints it) and the local
+    time as "Ddd D Mon HH:MM" (D without a leading zero), joined by three
+    spaces, then a blank line.
+  - The SSH table and the tmux table. Both are left out if /run/lobby-ssh
+    cannot be read.
+  - The Claude table. Left out if neither config folder exists.
+  - The footer.
+Each table is followed by one blank line.
+
+A table is a header row of column names in capitals, then one row per item.
+Every line of a table starts with two spaces. Cells are separated by two
+spaces, every column is as wide as its widest cell (header included), and
+trailing spaces are removed. An empty cell is shown as "-". The SSH or tmux
+table with no rows is the single line "  <first column name>  (none)".
+
+  SSH     Columns SSH REMOTE USER CWD. One row per connection in
+          /run/lobby-ssh: inbound ("in") first, then outbound ("out"), each
+          in the file's order. USER is "-" where the file says "?". CWD is
+          the folder with ~ for $HOME. Rows equal in every cell are one row,
+          at the place of the first, with " (N)" added to REMOTE.
+  TMUX    Columns TMUX SESSION WINDOWS ATTACHED. One row per tmux session,
+          in the file's order: user, session, window count, yes or no.
+  CLAUDE  Columns <first section's command in capitals> NAME STATE TMUX
+          CWD. Sections as in claude-sessions, MAIN first, in one table so
+          the columns line up across sections. The first section's rows
+          follow the header row; every later section starts with a blank
+          line and a line with its command in capitals ("  CLAUDE-ALT").
+          Cells are claude-sessions' row cells without their prefixes and
+          leading spaces: time, name, state, tmux session, folder. A section
+          with no sessions shows "  (none)". Column widths are taken over
+          the rows shown, after fitting; section lines and "(none)" lines
+          do not count.
+
+Size: W columns and H lines are the terminal's size; $COLUMNS and $LINES
+win when set; with no terminal, 80 and 24. Every line longer than W, the
+first line and the footer included, is cut to W - 1 characters and "…". Claude rows are fitted so that the output has at
+most H lines, with claude-sessions' rule for fitting to $LINES (ALT up to 5
+rows, MAIN as many as fit in the rest, ALT then takes whatever is left), and
+every section shows at least one line, even if the output gets longer.
+
+Footer: two spaces and these parts, joined by three spaces:
+  - "ssh <age>": the age of /run/lobby-ssh (its modification time), or
+    "no <path>" with the path read if it cannot be read;
+  - "claude <age>": the age of the daemon file, if it was used; else
+    "claude fresh";
+  - "tmux since <time>" if any tmux-resurrect snapshot exists, with the
+    time claude-sessions' header shows.
+An age is "<N>s ago" under a minute, "<N>m ago" under an hour, else
+"<N>h ago", N rounded down.
+
 CLAUDE-SESSIONS
 ---------------
   claude-sessions [-n N] [-r] [--tsv] [WORD...]
+  claude-sessions --watch
 
 Lists Claude Code sessions from two config folders, each its own section:
 
@@ -114,6 +220,18 @@ A config folder that does not exist gets no section.
   WORD...   keep only rows whose name, auto title, last prompt, folder or
             session id contain every WORD, ignoring case. A grouped row is
             matched on the session it shows.
+  --watch   run until killed, writing the daemon file at start and then
+            every 10 s (below).
+            claude-sessions.service runs this.
+
+The daemon file, $XDG_RUNTIME_DIR/lobby-claude, holds every session, already
+grouped, for the other modes and lobby to read; its format is internal.
+--watch replaces it in one step (writes a temporary file in the same folder,
+then renames it). Any other run uses it instead of reading the config
+folders if it is younger than 30 s (modification time) and was written for
+the same $HOME. The output is then what reading the folders gave when the
+file was written. Without $XDG_RUNTIME_DIR there is no daemon file: --watch
+exits with an error, other runs read the folders.
 
 Example (invented sessions):
 
@@ -189,9 +307,9 @@ Where the data comes from
       a status symbol, a space, and the session name.
   ~/.local/state/claude-sessions/tmux.tsv
       claude-sessions' own memory, because Claude deletes sessions/<pid>.json
-      when it exits. Each run appends "<session id>\t<tmux session>\n" for
-      ids seen in sessions/*.json that are new or newly inside tmux (empty
-      tmux session = seen outside tmux).
+      when it exits. Each run that reads the config folders appends
+      "<session id>\t<tmux session>\n" for ids seen in sessions/*.json that
+      are new or newly inside tmux (empty tmux session = seen outside tmux).
 
 The tmux cell, best evidence first:
   1. the tmux session recorded for this id in sessions/*.json (running or
@@ -206,7 +324,8 @@ SSH-STATUS
 ----------
   ssh-status
 
-Writes a snapshot to /run/ssh-status ($SSH_STATUS_OUT overrides the path):
+Writes a snapshot to /run/lobby-ssh ($SSH_STATUS_OUT overrides the path),
+replacing the file in one step, mode 0644:
 
   SSH SESSIONS  -  <hostname>  -  <YYYY-MM-DD HH:MM:SS TZ>
 
@@ -220,7 +339,10 @@ Writes a snapshot to /run/ssh-status ($SSH_STATUS_OUT overrides the path):
     <user>   <session>   <N> window(s), attached|detached
 
 with "  (none)" for an empty section and a blank line between sections.
-ssh-status.service reruns it every 3 s.
+Cells are separated by one or more spaces; only the folder and the tmux
+session name can contain spaces. The <user> of a connection is "?" when
+unknown; a tmux <user> is "uid<N>" when the uid has no name. "cwd=…" is
+left out when no shell was found. ssh-status.service reruns it every 3 s.
 
 PRIVACY
 -------

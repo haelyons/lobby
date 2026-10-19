@@ -1,0 +1,9 @@
+[Unit]
+Description=Keep $XDG_RUNTIME_DIR/lobby-claude current (Claude Code sessions for lobby)
+
+[Service]
+ExecStart=%h/.local/bin/claude-sessions --watch
+Restart=always
+
+[Install]
+WantedBy=default.target
