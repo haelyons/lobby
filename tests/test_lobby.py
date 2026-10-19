@@ -1,7 +1,7 @@
 """lobby, tested from README.txt alone (LOBBY; its input is the SSH-STATUS snapshot).
 
 Runs have no terminal, explicit $COLUMNS and $LINES, $SSH_STATUS_OUT pointing at
-a snapshot written here, and the fake $HOME and time zone of test_claude_sessions.
+a snapshot written here, and the fake $HOME and time zone of test_sessions.
 """
 import os
 import re
@@ -10,7 +10,7 @@ import sys
 import time
 import unittest
 
-from tests import test_claude_sessions as cs
+from tests import test_sessions as cs
 
 EXAMPLE = """\
 lobby   box   Thu 16 Oct 11:40
@@ -23,14 +23,11 @@ lobby   box   Thu 16 Oct 11:40
   me    web      2        yes
   me    notes    1        no
 
-  CLAUDE     NAME         STATE  TMUX  CWD
-  11:35      SITE-DEPLOY  idle   web   ~/src/site
-  Tue 09:14  notes (3)    -      -     ~/notes
+  SESSIONS   TOOL    NAME         STATE  TMUX  CWD
+  11:35      claude  SITE-DEPLOY  idle   web   ~/src/site
+  Tue 09:14  claude  notes (3)    -      -     ~/notes
 
-  CLAUDE-ALT
-  (none)
-
-  ssh 2s ago   claude 4s ago   tmux since Wed 18:52
+  ssh 2s ago   sessions 4s ago   tmux since Wed 18:52
 """
 TITLES = ("INBOUND   (remote -> this host:22)", "OUTBOUND  (this host -> remote:22)",
           "TMUX      (sessions across all users)")
@@ -67,7 +64,6 @@ class LobbyTest(cs.Case):
         self.pid_file(self.main, site, tmux="web:@3.%7", run=True)
         for days, hhmm in ((2, "09:14"), (3, "08:00"), (4, "08:00")):
             self.session(self.main, ai="notes", cwd="~/notes", mtime=self.at(hhmm, days))
-        self.alt.mkdir()
         self.write_daemon_file()
         t = time.time()
         os.utime(self.ssh, (t - 2, t - 2))
@@ -79,7 +75,7 @@ class LobbyTest(cs.Case):
             "since Wed", f"since {self.ddd(1)}").splitlines()
         expected[0] = f"lobby   {os.uname().nodename}   {cs.WEEKDAYS[d.weekday()]} {d.day} {cs.MONTHS[d.month - 1]} 11:40"
         self.assertEqual(out[:-1], expected[:-1], self.r.stderr)
-        self.assertIn(out[-1], [f"  ssh {2 + i}s ago   claude {4 + j}s ago   tmux since {self.ddd(1)} 18:52"
+        self.assertIn(out[-1], [f"  ssh {2 + i}s ago   sessions {4 + j}s ago   tmux since {self.ddd(1)} 18:52"
                                 for i in late for j in late])
 
     def test_snapshot_rows(self):
@@ -109,44 +105,39 @@ class LobbyTest(cs.Case):
 
     def test_fit_to_LINES_without_snapshot(self):
         for i in range(10):
-            self.session(self.main, ai=f"m{i}", mtime=self.at("09:00", 10 + i))
-        self.session(self.main, ai="the oldest session, never shown", mtime=self.at("09:00", 30))
-        for i in range(8):
-            self.session(self.alt, ai=f"a{i}", mtime=self.at("09:00", 10 + i))
-        # 7 fixed lines: first line, blanks, header row, CLAUDE-ALT, footer
-        for lines, n_main, n_alt in ((14, 2, 5), (5, 1, 1)):
+            self.session(self.main if i % 2 else self.alt, ai=f"m{i}", mtime=self.at("09:00", 10 + i))
+        self.oc_session(title="the oldest session, never shown", mtime=self.at("09:00", 30))
+        # 5 fixed lines: first line, blank, header row, blank, footer
+        for lines, n in ((9, 4), (5, 1)):
             with self.subTest(LINES=lines):
                 out = self.run_lobby(lines=lines)
-                self.assertEqual(len(out), max(lines, 9), out)
-                self.assertEqual(out[2], "  CLAUDE  NAME  STATE  TMUX  CWD", out)
-                main, alt = out[3:3 + n_main], out[5 + n_main:-2]
-                self.assertEqual(out[3 + n_main:5 + n_main], ["", "  CLAUDE-ALT"], out)
-                self.assertEqual([re.split(" {2,}", l)[2] for l in main + alt],
-                                 [f"m{i}" for i in range(n_main)] + [f"a{i}" for i in range(n_alt)])
-                self.assertEqual(out[-1], f"  no {self.ssh}   claude fresh")
+                self.assertEqual(len(out), max(lines, 6), out)
+                self.assertEqual(out[2], "  SESSIONS  TOOL        NAME  STATE  TMUX  CWD", out)
+                self.assertEqual([re.split(" {2,}", l)[3] for l in out[3:-2]], [f"m{i}" for i in range(n)])
+                self.assertEqual(out[-1], f"  no {self.ssh}   sessions fresh")
 
     def test_words_pick_tables(self):
         self.write_ssh(inbound=["10.0.0.7   user=me"], tmux=["me   web   1 window(s), attached"])
         self.snapshot(self.at("18:52", 1))
         self.session(self.main, ai="alpha")
-        claude = f"claude fresh   tmux since {self.ddd(1)} 18:52"
-        for args, tables, footer in (((), ["SSH", "TMUX", "CLAUDE"], "ssh 2h ago   " + claude),
-                                     (("claude", "ssh"), ["SSH", "CLAUDE"], "ssh 2h ago   " + claude),
+        claude = f"sessions fresh   tmux since {self.ddd(1)} 18:52"
+        for args, tables, footer in (((), ["SSH", "TMUX", "SESSIONS"], "ssh 2h ago   " + claude),
+                                     (("sessions", "ssh"), ["SSH", "SESSIONS"], "ssh 2h ago   " + claude),
                                      (("tmux",), ["TMUX"], "ssh 2h ago"),
-                                     (("claude", "claude"), ["CLAUDE"], claude)):
+                                     (("sessions", "sessions"), ["SESSIONS"], claude)):
             with self.subTest(args=args):
                 out = self.run_lobby(*args)
                 self.assertEqual([l.split()[0] for l in out
-                                  if l.startswith(("  SSH  ", "  TMUX  ", "  CLAUDE  "))], tables, out)
+                                  if l.startswith(("  SSH  ", "  TMUX  ", "  SESSIONS  "))], tables, out)
                 self.assertEqual(out[-1], "  " + footer)
         for arg in ("--usage", "--help", "-h"):
             with self.subTest(arg=arg):
                 text = "\n".join(self.run_lobby(arg))
                 self.assertEqual(self.r.returncode, 0, self.r.stderr)
-                self.assertTrue(all(w in text for w in ("ssh", "tmux", "claude")), text)
+                self.assertTrue(all(w in text for w in ("ssh", "tmux", "sessions")), text)
                 self.assertNotIn("  SSH  REMOTE", text)
                 self.assertLess(text.count("\n"), 20, "a short usage")
-        for arg in ("--bogus", "sshh"):
+        for arg in ("--bogus", "sshh", "claude"):
             with self.subTest(arg=arg):
                 self.run_lobby(arg)
                 self.assertNotEqual(self.r.returncode, 0)

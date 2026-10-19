@@ -1,4 +1,4 @@
-"""claude-sessions, tested from README.txt alone (CLAUDE-SESSIONS) as a black box.
+"""sessions, tested from README.txt alone (SESSIONS) as a black box.
 
 Each test gets a fake $HOME and $XDG_RUNTIME_DIR in a temp folder and a
 fixed-offset TZ in which it is 11:40:05 when the test starts, so the README's
@@ -9,6 +9,7 @@ import json
 import os
 import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -25,16 +26,13 @@ MONTHS = "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split()
 NOT_RUNNING = 4194305  # above Linux's largest pid, so never alive
 
 EXAMPLE = """\
-CLAUDE SESSIONS  -  by last activity  -  tmux recorded since Wed 18:52
+SESSIONS  -  by last activity  -  tmux recorded since Wed 18:52
 
-MAIN      (claude -> ~/.claude)
-  11:35       SITE-DEPLOY      idle   tmux=web   cwd=~/src/site
-  10:02       notes (3)                          cwd=~/notes
-  Tue 09:14   fix flaky test                     cwd=~/src/api
-
-ALT       (claude-alt -> ~/.claude-alt)
-  (none)
+  11:35       claude       SITE-DEPLOY   idle   tmux=web   cwd=~/src/site
+  10:02       claude-alt   XTAL-* (3)    busy              cwd=~/stage
+  Tue 09:14   opencode     runs (40)                       cwd=~/src/lab
 """
+RUN_PERMISSION = json.dumps([{"permission": "question", "pattern": "*", "action": "deny"}])
 
 
 def pad(rows):
@@ -43,15 +41,10 @@ def pad(rows):
     return ["   ".join(c.ljust(w) for c, w in zip(r, widths)).rstrip() for r in rows]
 
 
-def sections(out):
-    """{"MAIN": [names], "ALT": [names]} from --tsv output."""
-    secs, cur = {}, None
-    for line in out.splitlines():
-        if line.startswith(("MAIN ", "ALT ")):
-            cur = secs.setdefault(line.split()[0], [])
-        elif line.startswith("  ") and cur is not None:
-            cur.append(line.split("\t")[1] if "\t" in line else line.strip())
-    return secs
+def names(out):
+    """Name cells (or "(none)") of --tsv output, in order."""
+    return [l.split("\t")[2] if "\t" in l else l.strip()
+            for l in out.splitlines()[2:] if l.startswith("  ")]
 
 
 class Case(unittest.TestCase):
@@ -64,7 +57,8 @@ class Case(unittest.TestCase):
         self.home.mkdir()
         self.runtime.mkdir(mode=0o700)
         self.main, self.alt = self.home / ".claude", self.home / ".claude-alt"
-        self.daemon = self.runtime / "lobby-claude"
+        self.daemon = self.runtime / "lobby-sessions"
+        self.oc_db = self.home / ".local/share/opencode/opencode.db"
         self.now = time.time()
         off = round(11 * 3600 + 40 * 60 + 5 - self.now) % DAY
         off -= DAY if off > DAY // 2 else 0
@@ -131,6 +125,52 @@ class Case(unittest.TestCase):
             data["tmux"] = tmux
         (folder / f"{pid}.json").write_text(json.dumps(data))
 
+    def oc_session(self, title="", slug="calm-river", cwd="~/proj", mtime=None, run=False,
+                   worktree="/", sid=None, last=None):
+        """A top-level opencode session in opencode.db; last is the data of
+        its newest message, if any."""
+        sid = sid or "ses_" + uuid.uuid4().hex
+        self.oc_db.parent.mkdir(parents=True, exist_ok=True)
+        db = sqlite3.connect(self.oc_db)
+        db.executescript(
+            "CREATE TABLE IF NOT EXISTS project (id TEXT PRIMARY KEY, worktree TEXT);"
+            "CREATE TABLE IF NOT EXISTS session (id TEXT PRIMARY KEY, project_id TEXT, parent_id TEXT,"
+            " slug TEXT, directory TEXT, title TEXT, permission TEXT, time_updated INTEGER,"
+            " time_archived INTEGER);"
+            "CREATE TABLE IF NOT EXISTS message (id TEXT PRIMARY KEY, session_id TEXT,"
+            " time_created INTEGER, data TEXT);")
+        db.execute("INSERT OR IGNORE INTO project VALUES (?, ?)", (worktree, self.expand(worktree)))
+        db.execute("INSERT INTO session VALUES (?, ?, NULL, ?, ?, ?, ?, ?, NULL)",
+                   (sid, worktree, slug, self.expand(cwd), title, RUN_PERMISSION if run else None,
+                    int((mtime or self.at("09:00", 10)) * 1000)))
+        if last:
+            db.execute("INSERT INTO message VALUES (?, ?, 1, ?)", ("msg_" + sid, sid, json.dumps(last)))
+        db.commit()
+        db.close()
+        return sid
+
+    def oc_process(self, cwd, *args, **env):
+        """A live process that looks like an opencode TUI: argv[0] named
+        opencode (python3 behind a symlink), args (-s <file> runs <file>,
+        -m <module> runs <module>), working folder cwd."""
+        cwd = Path(self.expand(cwd))
+        cwd.mkdir(parents=True, exist_ok=True)
+        link = self.tmp / "bin" / "opencode"
+        if not link.exists():
+            link.parent.mkdir()
+            link.symlink_to(sys.executable)
+        for a in args:
+            if a.startswith(("ses_", "oc_sleep")):
+                (cwd / (a + ".py" if a == "oc_sleep" else a)).write_text("import time; time.sleep(600)\n")
+        p = subprocess.Popen([str(link), *args], cwd=cwd, env=self.env(**env))
+        self.addCleanup(p.wait)
+        self.addCleanup(p.kill)
+        deadline = time.monotonic() + 10
+        while Path(f"/proc/{p.pid}/cmdline").read_bytes().split(b"\0")[0] != str(link).encode():
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.02)
+        return p
+
     def snapshot(self, ts, *panes):
         """A tmux-resurrect snapshot named after ts; panes are (session, title, folder)."""
         folder = self.home / ".local/share/tmux/resurrect"
@@ -155,14 +195,14 @@ class Case(unittest.TestCase):
         return env
 
     def run_cs(self, *args, timeout=60, **env):
-        self.r = subprocess.run([sys.executable, str(REPO / "claude-sessions"), *args],
+        self.r = subprocess.run([sys.executable, str(REPO / "sessions"), *args],
                                 env=self.env(**env), cwd=self.tmp, stdin=subprocess.DEVNULL,
                                 capture_output=True, text=True, timeout=timeout)
         return self.r.stdout
 
     def write_daemon_file(self):
         """Run --watch until it has written the daemon file, then kill it."""
-        p = subprocess.Popen([sys.executable, str(REPO / "claude-sessions"), "--watch"],
+        p = subprocess.Popen([sys.executable, str(REPO / "sessions"), "--watch"],
                              env=self.env(), cwd=self.tmp, stdin=subprocess.DEVNULL,
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                              start_new_session=True)
@@ -174,41 +214,39 @@ class Case(unittest.TestCase):
             with contextlib.suppress(ProcessLookupError):
                 os.killpg(p.pid, signal.SIGKILL)
             p.wait()
-        self.assertTrue(self.daemon.exists(), "--watch should write $XDG_RUNTIME_DIR/lobby-claude")
+        self.assertTrue(self.daemon.exists(), "--watch should write $XDG_RUNTIME_DIR/lobby-sessions")
 
 
-class ClaudeSessionsTest(Case):
+class SessionsTest(Case):
 
     def test_readme_example(self):
         self.snapshot(self.at("18:52", 1))
         site = self.session(self.main, name="SITE-DEPLOY", cwd="~/src/site", mtime=self.at("11:35"))
         self.pid_file(self.main, site, tmux="web:@3.%7", run=True)
-        for days, hhmm in ((0, "10:02"), (3, "08:00"), (4, "08:00")):
-            self.session(self.main, ai="notes", cwd="~/notes", mtime=self.at(hhmm, days))
-        self.session(self.main, ai="fix flaky test", cwd="~/src/api", mtime=self.at("09:14", 2))
-        self.alt.mkdir()
+        xtal = self.session(self.alt, name="XTAL", cwd="~/stage", mtime=self.at("10:02"))
+        self.pid_file(self.alt, xtal, status="busy", run=True)
+        self.session(self.alt, name="XTAL-PILOT", cwd="~/stage/p", mtime=self.at("08:00", 3))
+        self.session(self.main, name="XTAL-REPLAY-B", cwd="~/stage", mtime=self.at("08:00", 4))
+        for i in range(40):
+            self.oc_session(title=f"judge-{i}", cwd=f"~/src/lab/calls/{i}", run=True,
+                            worktree="~/src/lab", mtime=self.at("09:14", 2) - i * 60)
         expected = EXAMPLE.replace("since Wed", f"since {self.ddd(1)}").replace(
             "Tue 09:14", f"{self.ddd(2)} 09:14")
         self.assertEqual(self.run_cs(), expected, self.r.stderr)
         lines = expected.split("\n")
-        lines[3:6] = ["  11:35\tSITE-DEPLOY\tidle\ttmux=web\tcwd=~/src/site",
-                      "  10:02\tnotes (3)\t\t\tcwd=~/notes",
-                      f"  {self.ddd(2)} 09:14\tfix flaky test\t\t\tcwd=~/src/api"]
+        lines[2:5] = ["  11:35\tclaude\tSITE-DEPLOY\tidle\ttmux=web\tcwd=~/src/site",
+                      "  10:02\tclaude-alt\tXTAL-* (3)\tbusy\t\tcwd=~/stage",
+                      f"  {self.ddd(2)} 09:14\topencode\truns (40)\t\t\tcwd=~/src/lab"]
         self.assertEqual(self.run_cs("--tsv"), "\n".join(lines), self.r.stderr)
 
     def test_tsv_fits_to_LINES(self):
         for i in range(10):
-            self.session(self.main, ai=f"m{i}", mtime=self.at("09:00", 10 + i))
-        for i in range(8):
-            self.session(self.alt, ai=f"a{i}", mtime=self.at("09:00", 10 + i))
-        # 5 fixed lines; ALT gets up to 5 rows, MAIN the rest, ALT what is left;
-        # every section at least one line
-        for lines, n_main, n_alt in ((12, 2, 5), (22, 10, 7), (4, 1, 1)):
+            self.session(self.main if i % 2 else self.alt, ai=f"m{i}", mtime=self.at("09:00", 10 + i))
+        # header and blank count; at least one row
+        for lines, n in ((6, 4), (40, 10), (1, 1)):
             with self.subTest(LINES=lines):
                 out = self.run_cs("--tsv", "-n", "1", LINES=lines)
-                self.assertEqual(sections(out), {"MAIN": [f"m{i}" for i in range(n_main)],
-                                                 "ALT": [f"a{i}" for i in range(n_alt)]}, out)
-                self.assertEqual(len(out.splitlines()), max(lines, 7), out)
+                self.assertEqual(names(out), [f"m{i}" for i in range(n)], out)
 
     def test_tmux_cell_evidence_order(self):
         a = self.session(self.main, name="alpha", cwd="~/a")
@@ -228,32 +266,47 @@ class ClaudeSessionsTest(Case):
 
         def cells():
             out = self.run_cs("--tsv")
-            return {c[1]: c[3] for c in (l.split("\t") for l in out.splitlines() if "\t" in l)}
+            return {c[2]: c[4] for c in (l.split("\t") for l in out.splitlines() if "\t" in l)}
 
         self.assertEqual(cells(), want, self.r.stderr)
         self.assertIn(f"{a}\trec\n", memory.read_text())
         shutil.rmtree(self.main / "sessions")  # Claude deletes sessions/<pid>.json on exit
         self.assertEqual(cells(), want, "tmux.tsv should remember the tmux session")
 
-    def test_grouping(self):
-        old = self.session(self.main, ai="shared", cwd="~/g", mtime=self.at("08:00", 3))
-        self.pid_file(self.main, old, tmux="run:@1.%1", status="busy", run=True)
-        self.session(self.main, ai="shared", cwd="~/g", mtime=self.at("10:00"))
-        other = self.session(self.main, ai="shared", cwd="~/h", mtime=self.at("09:00"))
-        long = "N" * 31  # grouping is by full name, before the cut to 31 + "…"
+    def test_folding(self):
+        x = self.ddd(1)
+        self.session(self.main, name="XTAL-A-1", cwd="~/x", mtime=self.at("10:00"))
+        busy = self.session(self.alt, name="XTAL-A-2", cwd="~/y", mtime=self.at("09:00"))
+        self.pid_file(self.alt, busy, tmux="xt:@1.%1", status="busy", run=True)
+        self.session(self.main, name="XTAL-B", cwd="~/x", mtime=self.at("08:00"))
+        fa = self.session(self.main, name="FR-A", cwd="~/f", mtime=self.at("07:00"))  # FR: too short
+        fb = self.session(self.main, name="FR-B", cwd="~/f", mtime=self.at("06:00"))
+        notes = self.session(self.main, ai="notes", cwd="~/n", mtime=self.at("05:00"))
+        self.session(self.main, ai="notes", cwd="~/elsewhere", mtime=self.at("04:00"))
+        long = "N" * 31  # cut to 31 + "…" after "-*"
         one = self.session(self.main, ai=long + "-one", cwd="~/g", mtime=self.at("08:00", 1))
-        two = self.session(self.main, ai=long + "-two", cwd="~/g", mtime=self.at("07:00", 1))
-        y = self.ddd(1)
+        self.session(self.main, ai=long + "-two", cwd="~/g", mtime=self.at("07:00", 1))
+        ja = self.oc_session(title="judge-a", cwd="~/lab/a", run=True, worktree="~/lab",
+                             mtime=self.at("06:00", 1))
+        self.oc_session(title="judge-b", cwd="~/lab/b", run=True, worktree="~/lab", mtime=self.at("05:00", 1))
+        probe = self.oc_session(title="probe", cwd="/tmp/p", run=True, mtime=self.at("04:00", 1))
+        self.oc_session(title="probe", cwd="/tmp/q", run=True, mtime=self.at("03:00", 1))
+        self.oc_session(title="XTAL-C", cwd="~/x", mtime=self.at("02:00", 2))  # TUI: folds by name
         out = self.run_cs("--tsv", "-r")
         self.assertEqual([l for l in out.splitlines() if l.startswith("  ")], [
-            "  10:00\tshared (2)\tbusy\ttmux=run\tcwd=~/g",
-            f"     cd ~/g && claude --resume {old}",
-            "  09:00\tshared\t\t\tcwd=~/h",
-            f"     cd ~/h && claude --resume {other}",
-            f"  {y} 08:00\t{long}…\t\t\tcwd=~/g",
-            f"     cd ~/g && claude --resume {one}",
-            f"  {y} 07:00\t{long}…\t\t\tcwd=~/g",
-            f"     cd ~/g && claude --resume {two}"], self.r.stderr)
+            "  10:00\tclaude-alt\tXTAL-* (4)\tbusy\ttmux=xt\tcwd=~/y",
+            f"     cd ~/y && claude-alt --resume {busy}",
+            "  07:00\tclaude\tFR-A\t\t\tcwd=~/f", f"     cd ~/f && claude --resume {fa}",
+            "  06:00\tclaude\tFR-B\t\t\tcwd=~/f", f"     cd ~/f && claude --resume {fb}",
+            "  05:00\tclaude\tnotes (2)\t\t\tcwd=~/n", f"     cd ~/n && claude --resume {notes}",
+            f"  {x} 08:00\tclaude\t{long}… (2)\t\t\tcwd=~/g", f"     cd ~/g && claude --resume {one}",
+            f"  {x} 06:00\topencode\truns (2)\t\t\tcwd=~/lab", f"     cd ~/lab/a && opencode -s {ja}",
+            f"  {x} 04:00\topencode\truns (2)\t\t\tcwd=/tmp/p", f"     cd /tmp/p && opencode -s {probe}"],
+            self.r.stderr)
+        self.assertEqual(len(names(self.run_cs("--tsv", "-u"))), 14, "-u: one row per session")
+        self.assertEqual(names(self.run_cs("--tsv", "xtal-a")), ["XTAL-A-* (2)"],
+                         "words filter before folding")
+        self.assertEqual(names(self.run_cs("--tsv", "-u", "xtal-a")), ["XTAL-A-1", "XTAL-A-2"])
 
     def test_word_filter(self):
         self.session(self.main, name="Deploy Site", ai="kiwi", prompt="fix the BUG",
@@ -263,48 +316,72 @@ class ClaudeSessionsTest(Case):
                      sid="5e55a1d0-0000-4000-8000-000000000000")
         self.session(self.main, ai="pair", prompt="zebra", mtime=self.at("09:00", 14))
         self.session(self.main, ai="pair", prompt="yak", mtime=self.at("09:00", 13))
-        for words, names in ((["deploy"], ["Deploy Site", "Notes"]),
-                             (["DEPLOY", "bug"], ["Deploy Site"]),
-                             (["Kiwi"], ["Deploy Site"]),
-                             (["qzfolder"], ["misc"]),
-                             (["5E55A1D0"], ["misc"]),
-                             (["yak"], ["pair (2)"]),
-                             (["zebra"], ["(none)"])):  # a group matches on the session shown
+        self.oc_session(title="Lab Notes", cwd="~/lab", mtime=self.at("09:00", 15),
+                        sid="ses_0c0de")
+        for words, want in ((["deploy"], ["Deploy Site", "Notes"]),
+                            (["DEPLOY", "bug"], ["Deploy Site"]),
+                            (["Kiwi"], ["Deploy Site"]),
+                            (["qzfolder"], ["misc"]),
+                            (["5E55A1D0"], ["misc"]),
+                            (["pair"], ["pair (2)"]),
+                            (["zebra"], ["pair"]),
+                            (["notes"], ["Notes", "Lab Notes"]),
+                            (["ses_0C0DE"], ["Lab Notes"]),
+                            (["nothing-like-this"], ["(none)"])):
             with self.subTest(words=words):
-                self.assertEqual(sections(self.run_cs("--tsv", *words))["MAIN"], names)
+                self.assertEqual(names(self.run_cs("--tsv", *words)), want)
 
     def test_resume_lines_and_long_folders(self):
         deep, srv = "~/research/projects/2026/experiments/run_c", "/srv/data/archive/2026/q3/experiments/x/y"
-        t1, t2, t3 = self.at("09:00", 10), self.at("09:00", 11), self.at("09:00", 12)
+        t1, t2, t3, t4 = (self.at("09:00", 10 + i) for i in range(4))
         m = self.session(self.main, ai="deep", cwd=deep, mtime=t1)
         o = self.session(self.main, ai="srv", cwd=srv, mtime=t2)
         a = self.session(self.alt, ai="alt one", cwd="~/notes", mtime=t3)
-        r1, r2, r3 = pad([["  " + self.when(t1), "deep", "", "", "cwd=~/…/experiments/run_c"],
-                          ["  " + self.when(t2), "srv", "", "", "cwd=/…/x/y"],
-                          ["  " + self.when(t3), "alt one", "", "", "cwd=~/notes"]])
+        c = self.oc_session(slug="calm-river", title="New session - 2026-10-19T12:03:20.677Z",
+                            cwd="~/oc", mtime=t4)
+        r1, r2, r3, r4 = pad([["  " + self.when(t1), "claude", "deep", "", "", "cwd=~/…/experiments/run_c"],
+                              ["  " + self.when(t2), "claude", "srv", "", "", "cwd=/…/x/y"],
+                              ["  " + self.when(t3), "claude-alt", "alt one", "", "", "cwd=~/notes"],
+                              ["  " + self.when(t4), "opencode", "calm-river", "", "", "cwd=~/oc"]])
         self.assertEqual(self.run_cs("-r"), "\n".join([
-            "CLAUDE SESSIONS  -  by last activity", "",
-            "MAIN      (claude -> ~/.claude)",
+            "SESSIONS  -  by last activity", "",
             r1, f"     cd {deep} && claude --resume {m}",
-            r2, f"     cd {srv} && claude --resume {o}", "",
-            "ALT       (claude-alt -> ~/.claude-alt)",
-            r3, f"     cd ~/notes && claude-alt --resume {a}", ""]), self.r.stderr)
+            r2, f"     cd {srv} && claude --resume {o}",
+            r3, f"     cd ~/notes && claude-alt --resume {a}",
+            r4, f"     cd ~/oc && opencode -s {c}", ""]), self.r.stderr)
+
+    def test_running_opencode_tui(self):
+        fake_tmux = self.tmp / "bin2" / "tmux"
+        fake_tmux.parent.mkdir()
+        fake_tmux.write_text('#!/bin/sh\n[ "$*" = "-S /sock display-message -p -t %9 #S" ] && echo lab\n')
+        fake_tmux.chmod(0o755)
+        named = self.oc_session(title="named", cwd="~/a", mtime=self.at("09:00", 1), sid="ses_named",
+                                last={"role": "assistant", "time": {"created": 1, "completed": 2}})
+        self.oc_process("~/a", "-s", named, TMUX="/sock,1,0", TMUX_PANE="%9")
+        self.oc_process("~/b", "-m", "oc_sleep")  # no -s: the newest session there since it started
+        self.oc_session(title="old", cwd="~/b", mtime=self.now - 600)
+        self.oc_session(title="fresh", cwd="~/b", mtime=time.time() + 5, last={"role": "user"})
+        self.oc_session(title="in run", cwd="~/b", mtime=time.time() + 6, run=True, worktree="~/b")
+        out = self.run_cs("--tsv", "-u", PATH=f"{fake_tmux.parent}:{os.environ['PATH']}")
+        rows = {c[2]: c[3:5] for c in (l.split("\t") for l in out.splitlines() if "\t" in l)}
+        self.assertEqual(rows, {"named": ["idle", "tmux=lab"], "fresh": ["busy", ""],
+                                "old": ["", ""], "in run": ["", ""]}, self.r.stderr)
 
     def test_daemon_file_used_only_when_fresh_and_same_home(self):
         self.session(self.main, ai="before")
         self.write_daemon_file()
         self.session(self.main, ai="after", mtime=self.at("09:00", 1))
-        self.assertEqual(sections(self.run_cs("--tsv"))["MAIN"], ["before"],
+        self.assertEqual(names(self.run_cs("--tsv")), ["before"],
                          "a fresh daemon file is used instead of the folders")
         other = self.home
         self.home = self.tmp / "other"
         self.session(self.home / ".claude", ai="elsewhere")
-        self.assertEqual(sections(self.run_cs("--tsv"))["MAIN"], ["elsewhere"],
+        self.assertEqual(names(self.run_cs("--tsv")), ["elsewhere"],
                          "a daemon file written for another $HOME is ignored")
         self.home = other
         old = time.time() - 31
         os.utime(self.daemon, (old, old))
-        self.assertEqual(sections(self.run_cs("--tsv"))["MAIN"], ["after", "before"],
+        self.assertEqual(names(self.run_cs("--tsv")), ["after", "before"],
                          "a daemon file older than 30 s is ignored")
 
     def test_watch_without_runtime_dir_fails(self):
@@ -314,7 +391,7 @@ class ClaudeSessionsTest(Case):
         except subprocess.TimeoutExpired:
             self.fail("--watch without $XDG_RUNTIME_DIR should exit with an error, not run")
         self.assertNotEqual(self.r.returncode, 0)
-        self.assertEqual(sections(self.run_cs("--tsv", XDG_RUNTIME_DIR=None))["MAIN"], ["alpha"])
+        self.assertEqual(names(self.run_cs("--tsv", XDG_RUNTIME_DIR=None)), ["alpha"])
 
 
 if __name__ == "__main__":

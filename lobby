@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""lobby: SSH, tmux and Claude sessions as tables sized to the terminal,
+"""lobby: SSH, tmux and agent sessions as tables sized to the terminal,
 from what the daemons last wrote. See README.txt.
 
-  lobby [ssh] [tmux] [claude] [--fresh]
+  lobby [ssh] [tmux] [sessions] [--fresh]
 
-  ssh       SSH connections in and out     /run/lobby-ssh
-  tmux      tmux sessions of all users     /run/lobby-ssh
-  claude    Claude Code sessions           claude-sessions daemon
-  --fresh   Claude sessions read now, not from the daemon
+  ssh       SSH connections in and out         /run/lobby-ssh
+  tmux      tmux sessions of all users         /run/lobby-ssh
+  sessions  Claude Code and opencode sessions  sessions daemon
+  --fresh   sessions read now, not from the daemon
 
   No word: all three.
 """
@@ -16,9 +16,9 @@ from importlib.machinery import SourceFileLoader
 
 SSH = os.environ.get('SSH_STATUS_OUT') or '/run/lobby-ssh'
 
-# claude-sessions is a script, not a module: load it from next to this file
-_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'claude-sessions')
-_loader = SourceFileLoader('claude_sessions', _path)
+# sessions is a script, not a module: load it from next to this file
+_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'sessions')
+_loader = SourceFileLoader('sessions', _path)
 cs = importlib.util.module_from_spec(importlib.util.spec_from_loader(_loader.name, _loader))
 _loader.exec_module(cs)
 
@@ -46,10 +46,10 @@ def ssh_rows(text):
     return rows, tmux
 
 
-def claude_cells(r, now):
-    """claude-sessions' row cells without their prefixes."""
-    when, name, state, tmux, cwd = cs.cells(r, now)
-    return [when.lstrip(), name, state, tmux.removeprefix('tmux='), cwd.removeprefix('cwd=')]
+def session_cells(r, now):
+    """sessions' row cells without their prefixes."""
+    when, tool, name, state, tmux, cwd = cs.cells(r, now)
+    return [when.lstrip(), tool, name, state, tmux.removeprefix('tmux='), cwd.removeprefix('cwd=')]
 
 
 def table(rows):
@@ -76,13 +76,13 @@ def main(argv):
     for a in argv:
         if a == '--fresh':
             fresh = True
-        elif a in ('ssh', 'tmux', 'claude'):
+        elif a in ('ssh', 'tmux', 'sessions'):
             want.add(a)
         elif a in ('-h', '--help', '--usage'):
             print(__doc__.rstrip()); return 0
         else:
             sys.exit(f'lobby: unknown argument {a} (see lobby --usage)')
-    want = want or {'ssh', 'tmux', 'claude'}
+    want = want or {'ssh', 'tmux', 'sessions'}
     width, height = shutil.get_terminal_size()
     now = time.time()
     t = time.localtime(now)
@@ -105,20 +105,15 @@ def main(argv):
             if 'tmux' in want:
                 out += table([['TMUX', 'SESSION', 'WINDOWS', 'ATTACHED']] + tmux) + ['']
 
-    if 'claude' in want:
+    if 'sessions' in want:
         rows, since, age = cs.load(fresh)
-        secs = cs.sections(rows)
-        if secs:
-            # room for rows: all but the header row, later sections' blank +
-            # label, and the blank + footer below
-            room = height - len(out) - 1 - 2 * (len(secs) - 1) - 2
-            body = [[secs[0][1].upper(), 'NAME', 'STATE', 'TMUX', 'CWD']]
-            for i, ((_, cmd, _, rs), take) in enumerate(zip(secs, cs.fit([len(s[3]) for s in secs], room))):
-                if i:
-                    body += ['', '  ' + cmd.upper()]
-                body += [claude_cells(r, now) for r in rs[:take]] or ['  (none)']
+        # room for rows: all but the header row and the blank + footer below
+        take = max(1, height - len(out) - 1 - 2)
+        body = [['SESSIONS', 'TOOL', 'NAME', 'STATE', 'TMUX', 'CWD']]
+        body += [session_cells(r, now) for r in cs.folded(rows)[:take]]
+        if cs.any_source():
             out += table(body) + ['']
-        foot.append('claude ' + (ago(age) if age is not None else 'fresh'))
+        foot.append('sessions ' + (ago(age) if age is not None else 'fresh'))
         if since:
             foot.append('tmux since ' + cs.when(since, now))
     out.append('  ' + '   '.join(foot))

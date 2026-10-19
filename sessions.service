@@ -1,0 +1,9 @@
+[Unit]
+Description=Keep $XDG_RUNTIME_DIR/lobby-sessions current (agent sessions for lobby)
+
+[Service]
+ExecStart=%h/.local/bin/sessions --watch
+Restart=always
+
+[Install]
+WantedBy=default.target
