@@ -72,6 +72,8 @@ def _read_meta(path, size):
     for d in _lines(path, 0, HEAD):
         if d.get('timestamp') and 'start' not in meta:
             meta['start'] = _epoch(d['timestamp'])
+        if d.get('entrypoint') == 'sdk-cli':
+            meta['headless'] = True  # claude -p
         if d.get('cwd'):
             meta['cwd'] = d['cwd']
             break
@@ -288,6 +290,8 @@ def _opencode(seen):
 #  3. an opencode run: the deepest folder holding it, below its project's
 #     and not a shared one (/, /tmp, ~), that a Claude session's Bash call
 #     named before the run started
+# Else headless Claude sessions (claude -p, so a script's) that share a tmux
+# session, two or more, get a stand-in parent row for that tmux session.
 # (tmux does not pass the caller's environment on, so CLAUDE_CODE_SESSION_ID
 # in a child's /proc/<pid>/environ misses most children.)
 
@@ -358,6 +362,19 @@ def _parents(rows, launches):
                     r['parent'] = max(c)[1]
                     break
                 f = os.path.dirname(f)
+    by_tmux = {}
+    for r in rows:
+        if r.get('headless') and 'parent' not in r and r['tmux'] and r['tmux'] != '?':
+            by_tmux.setdefault(r['tmux'], []).append(r)
+    for name, kids in by_tmux.items():
+        if len(kids) < 2:
+            continue
+        for r in kids:
+            r['parent'] = 'tmux:' + name
+        rows.append({'cmd': 'tmux', 'id': 'tmux:' + name, 'name': name, 'ai': '', 'prompt': '',
+                     'mtime': max(r['mtime'] for r in kids), 'start': min(r['start'] for r in kids),
+                     'cwd': os.path.commonpath([r['cwd'] for r in kids]), 'tmux': name,
+                     'state': None, 'run': None})
 
 
 # ---- rows ------------------------------------------------------------------
@@ -417,6 +434,7 @@ def sessions():
                     'ai': meta.get('ai') or '', 'prompt': meta.get('prompt') or '',
                     'tmux': tmux, 'state': live.get(sid),
                     'resume': f'cd {tilde(cwd)} && {cmd} --resume {sid}', 'run': None,
+                    'headless': meta.get('headless', False),
                 })
     _parents(rows, launches)
     rows.sort(key=lambda r: r['mtime'], reverse=True)

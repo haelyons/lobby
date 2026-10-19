@@ -262,6 +262,12 @@ this evidence, best first:
      deeper than its project's folder and not /, /tmp, $HOME or the folder
      above $HOME, that a Bash call of that session named at or before the
      run's start. The latest such call wins.
+  4. Else: a headless Claude session (one started with `claude -p`, so by a
+     script: its transcript has "entrypoint": "sdk-cli") whose tmux session
+     has two or more such sessions without a parent gets a stand-in parent,
+     a row for that tmux session: tool "tmux", name and tmux cell the tmux
+     session, folder the longest folder holding all of them, time the
+     newest of theirs. It has no resume line.
 In Bash calls, heredoc bodies are skipped; a path is a word containing
 "/", read relative to the call's folder and to the folders it cd's into,
 with $PWD as the call's folder. A session's start is the first timestamp in its transcript (Claude)
@@ -300,7 +306,7 @@ Row cells, in order:
        same day as now          HH:MM          11:35
        less than 6 x 24 h ago   Ddd HH:MM      Tue 09:14
        older                    D Mon          3 Oct
-  2. the tool: claude, claude-alt or opencode.
+  2. the tool: claude, claude-alt or opencode (tmux: a stand-in, Parents).
   3. name: for Claude, the /rename name, else Claude's auto title, else the
      first 8 characters of the session id; for opencode, its title, else
      its slug; for a family, as in Folding. Over 32 characters: the first
@@ -333,6 +339,7 @@ Where the data comes from
       Later title and prompt lines replace earlier ones. If no line has a
       cwd, the folder is the <anything> folder name with "-" read as "/".
         {"timestamp": "…", ...}                       start (first one)
+        {"entrypoint": "sdk-cli", ...}                headless (claude -p)
         {"type": "assistant", "cwd": "…", "timestamp": "…", "message":
          {"content": [{"type": "tool_use", "name": "Bash",
                        "input": {"command": "…"}}]}}  Bash calls (Parents)

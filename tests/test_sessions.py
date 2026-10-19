@@ -93,13 +93,14 @@ class Case(unittest.TestCase):
         return str(self.home) + folder[1:] if folder.startswith("~") else folder
 
     def session(self, config, name=None, ai=None, prompt=None, cwd="~/proj", mtime=None,
-                sid=None, start=None, calls=()):
+                sid=None, start=None, calls=(), headless=False):
         """A transcript <config>/projects/<cwd>/<sid>.jsonl modified at mtime,
         started at start, with Bash tool calls (time, command) run in cwd."""
         sid = sid or str(uuid.uuid4())
         cwd = self.expand(cwd)
         iso = lambda ts: datetime.fromtimestamp(ts, timezone.utc).isoformat().replace("+00:00", "Z")
-        lines = [dict({"type": "user", "cwd": cwd}, **({"timestamp": iso(start)} if start else {}))]
+        lines = [dict({"type": "user", "cwd": cwd}, **({"timestamp": iso(start)} if start else {}),
+                      **({"entrypoint": "sdk-cli"} if headless else {}))]
         lines += [{"type": "assistant", "cwd": cwd, "timestamp": iso(t), "message": {"content": [
             {"type": "tool_use", "name": "Bash", "input": {"command": c}}]}} for t, c in calls]
         for kind, key, value in (("custom-title", "customTitle", name),
@@ -392,6 +393,21 @@ class SessionsTest(Case):
                          "a word keeps the descendants of a match")
         self.assertEqual(self.run_cs("--tsv", "boss").splitlines()[2].split("\t")[0], "  09:00",
                          "a parent's time is the newest in its subtree")
+
+    def test_headless_sessions_under_their_tmux_session(self):
+        ids = []
+        for i, (tmux, headless) in enumerate((("loop", True), ("loop", True), ("loop", False), ("solo", True))):
+            ids.append(self.session(self.main, ai=f"s{i}", cwd=f"~/rev/r{i}", headless=headless,
+                                    mtime=self.at("09:00") - i * 60))
+            self.pid_file(self.main, ids[-1], tmux=f"{tmux}:@1.%1")
+        resume = [f"     cd ~/rev/r{i} && claude --resume {sid}" for i, sid in enumerate(ids)]
+        self.assertEqual(self.run_cs("--tsv", "-r").splitlines()[2:], [
+            "  09:00\ttmux\tloop\t\ttmux=loop\tcwd=~/rev",  # a stand-in: no resume line
+            "  09:00\tclaude\t· s0\t\ttmux=loop\tcwd=~/rev/r0", resume[0],
+            "  08:59\tclaude\t· s1\t\ttmux=loop\tcwd=~/rev/r1", resume[1],
+            "  08:58\tclaude\ts2\t\ttmux=loop\tcwd=~/rev/r2", resume[2],  # not headless
+            "  08:57\tclaude\ts3\t\ttmux=solo\tcwd=~/rev/r3", resume[3]],  # alone in its tmux
+            self.r.stderr)
 
     def test_children_shown(self):
         t0 = self.at("08:00")
